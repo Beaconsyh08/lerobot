@@ -255,21 +255,71 @@ def load_image_as_numpy(
     return img_array
 
 
-def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
-    """Get a transform function that convert items from Hugging Face dataset (pyarrow)
-    to torch tensors. Importantly, images are converted from PIL, which corresponds to
-    a channel last representation (h w c) of uint8 type, to a torch image representation
-    with channel first (c h w) of float32 type in range [0,1].
-    """
+# def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
+#     """Get a transform function that convert items from Hugging Face dataset (pyarrow)
+#     to torch tensors. Importantly, images are converted from PIL, which corresponds to
+#     a channel last representation (h w c) of uint8 type, to a torch image representation
+#     with channel first (c h w) of float32 type in range [0,1].
+#     """
+#     for key in items_dict:
+#         first_item = items_dict[key][0]
+#         if isinstance(first_item, PILImage.Image):
+#             to_tensor = transforms.ToTensor()
+#             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+#         elif first_item is None:
+#             pass
+#         else:
+#             items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+#     return items_dict
+
+
+def hf_transform_to_torch(items_dict: dict):
+    """简化版的转换函数，专注于图像和基本类型"""
+    from io import BytesIO
+    from PIL import Image
+    import torchvision.transforms as transforms
+    
+    to_tensor = transforms.ToTensor()
+    
     for key in items_dict:
+        if len(items_dict[key]) == 0:
+            continue
+            
         first_item = items_dict[key][0]
-        if isinstance(first_item, PILImage.Image):
-            to_tensor = transforms.ToTensor()
+        
+        # 处理PNG bytes图像
+        if isinstance(first_item, dict) and 'bytes' in first_item:
+            # print(f"转换图像列: {key}")
+            converted = []
+            
+            for img_data in items_dict[key]:
+                try:
+                    if isinstance(img_data, dict) and 'bytes' in img_data:
+                        pil_image = Image.open(BytesIO(img_data['bytes']))
+                        if pil_image.mode != 'RGB':
+                            pil_image = pil_image.convert('RGB')
+                        converted.append(to_tensor(pil_image))
+                    else:
+                        converted.append(torch.tensor(img_data))
+                except Exception as e:
+                    print(f"图像转换失败: {e}")
+                    converted.append(torch.zeros(3, 224, 224))
+            
+            items_dict[key] = converted
+            
+        # 处理PIL图像
+        elif isinstance(first_item, Image.Image):
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
-        elif first_item is None:
-            pass
-        else:
-            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            
+        # 处理其他类型（跳过字符串和None）
+        elif not isinstance(first_item, (str, type(None))):
+            try:
+                items_dict[key] = [torch.tensor(x) for x in items_dict[key]]
+            except Exception as e:
+                print(f"转换 {key} 失败: {e}")
+                # 保持原样或设置为默认值
+                pass
+                
     return items_dict
 
 

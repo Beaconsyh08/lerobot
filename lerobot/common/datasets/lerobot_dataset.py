@@ -77,6 +77,22 @@ from lerobot.common.robot_devices.robots.utils import Robot
 CODEBASE_VERSION = "v2.1"
 
 
+def _column_to_numpy(column) -> np.ndarray:
+    if isinstance(column, torch.Tensor):
+        return column.numpy()
+    if hasattr(column, "to_numpy"):
+        return column.to_numpy()
+    if hasattr(column, "to_pylist"):
+        data = column.to_pylist()
+    else:
+        data = list(column)
+    if len(data) == 0:
+        return np.array([])
+    if isinstance(data[0], torch.Tensor):
+        return torch.stack(data).numpy()
+    return np.asarray(data)
+
+
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -505,8 +521,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
 
         # Check timestamps
-        timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
-        episode_indices = torch.stack(self.hf_dataset["episode_index"]).numpy()
+        timestamps = _column_to_numpy(self.hf_dataset["timestamp"])
+        episode_indices = _column_to_numpy(self.hf_dataset["episode_index"])
         ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
         check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
 
