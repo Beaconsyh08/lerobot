@@ -20,7 +20,6 @@ import csv
 import logging
 import shutil
 import subprocess
-import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,6 +27,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from tqdm.auto import tqdm
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.common.utils.utils import init_logging
@@ -283,6 +283,72 @@ def _write_episode_csv(
     return True
 
 
+def _get_default_output_dir(root: Path) -> Path:
+    dataset_name = root.name or "dataset"
+    return root.parent / f"local_vis_{dataset_name}"
+
+
+def _all_precomputed_files_exist(
+    static_dir: Path,
+    episodes: list[int],
+    image_keys: list[str],
+    prepare_videos: bool,
+    prepare_csv: bool,
+    downsample: int | None,
+) -> bool:
+    if prepare_videos:
+        for ep_id in episodes:
+            for image_key in image_keys:
+                video_path = static_dir / "videos" / image_key / f"episode_{ep_id:06d}_h264.mp4"
+                if not video_path.is_file() or video_path.stat().st_size <= 0:
+                    return False
+
+    if prepare_csv:
+        ds = downsample if downsample and downsample > 1 else 1
+        csv_dir = static_dir / "csv"
+        for ep_id in episodes:
+            csv_path = csv_dir / f"episode_{ep_id:06d}_ds{ds}.csv"
+            if not csv_path.is_file():
+                return False
+
+    return True
+
+
+def _run_visualize_dataset_html(
+    root: Path,
+    repo_id: str,
+    output_dir: Path,
+    episodes: list[int] | None,
+    max_frames: int | None,
+    downsample: int | None,
+    precomputed_only: bool,
+    serve: bool,
+    host: str,
+    port: int,
+) -> None:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.scripts.visualize_dataset_html import MetaOnlyDataset, visualize_dataset_html
+
+    dataset = (
+        MetaOnlyDataset(repo_id, root=root)
+        if precomputed_only
+        else LeRobotDataset(repo_id, root=root)
+    )
+    visualize_dataset_html(
+        dataset=dataset,
+        episodes=episodes,
+        output_dir=output_dir,
+        serve=serve,
+        host=host,
+        port=port,
+        max_frames=max_frames,
+        prepare_videos=False,
+        downsample=downsample,
+        precompute_csv=False,
+        precomputed_only=precomputed_only,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -315,7 +381,10 @@ def main():
         "--output-dir",
         type=Path,
         default=None,
-        help="Output dir used by visualize_dataset_html (will write to <output-dir>/static/videos).",
+        help=(
+            "Output dir used by visualize_dataset_html (will write to <output-dir>/static/videos). "
+            "Default: <root parent>/local_vis_<root name>."
+        ),
     )
     parser.add_argument(
         "--prepare-videos",
@@ -326,7 +395,7 @@ def main():
     parser.add_argument(
         "--prepare-csv",
         type=int,
-        default=0,
+        default=1,
         help="Prepare downsampled CSV for time-series plots.",
     )
     parser.add_argument(
@@ -338,14 +407,44 @@ def main():
     parser.add_argument(
         "--downsample",
         type=int,
-        default=None,
+        default=5,
         help="Downsample time series by keeping one every N frames (e.g. 5).",
     )
     parser.add_argument(
         "--overwrite",
         type=int,
         default=0,
-        help="Overwrite existing mp4 files.",
+        help="Overwrite existing precomputed files.",
+    )
+    parser.add_argument(
+        "--run-visualize",
+        type=int,
+        default=1,
+        help="Automatically run visualize_dataset_html after preparing files.",
+    )
+    parser.add_argument(
+        "--precomputed-only",
+        type=int,
+        default=1,
+        help="When running visualize_dataset_html, only load precomputed CSV/videos.",
+    )
+    parser.add_argument(
+        "--serve",
+        type=int,
+        default=1,
+        help="Launch web server when visualize_dataset_html runs.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Web host used by visualize_dataset_html.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9090,
+        help="Web port used by visualize_dataset_html.",
     )
 
     args = parser.parse_args()
@@ -370,8 +469,7 @@ def main():
         episodes = args.episodes
 
     if args.output_dir is None:
-        safe_repo = repo_id.replace("/", "_")
-        output_dir = Path("outputs") / "visualize_dataset" / safe_repo
+        output_dir = _get_default_output_dir(args.root)
     else:
         output_dir = args.output_dir
 
@@ -381,53 +479,64 @@ def main():
     if args.prepare_csv:
         csv_dir.mkdir(parents=True, exist_ok=True)
 
-    total = len(episodes) * len(image_keys) if args.prepare_videos else len(episodes)
-    done = 0
+    overwrite = bool(args.overwrite)
+    needs_prepare = overwrite or not _all_precomputed_files_exist(
+        static_dir=static_dir,
+        episodes=episodes,
+        image_keys=image_keys,
+        prepare_videos=bool(args.prepare_videos),
+        prepare_csv=bool(args.prepare_csv),
+        downsample=args.downsample,
+    )
 
-    def print_progress(done_count: int) -> None:
-        if total == 0:
-            return
-        width = 30
-        filled = int(width * done_count / total)
-        bar = "#" * filled + "-" * (width - filled)
-        sys.stdout.write(f"\r[{bar}] {done_count}/{total}")
-        sys.stdout.flush()
+    if needs_prepare:
+        if args.prepare_videos or args.prepare_csv:
+            with tqdm(total=len(episodes), desc="Precomputing", unit="episode", dynamic_ncols=True) as pbar:
+                for ep_id in episodes:
+                    if args.prepare_videos:
+                        for image_key in image_keys:
+                            _encode_episode_key(
+                                args.root,
+                                meta,
+                                ep_id,
+                                image_key,
+                                static_dir,
+                                args.max_frames,
+                                overwrite,
+                            )
 
-    print_progress(done)
-    for ep_id in episodes:
-        if args.prepare_videos:
-            for image_key in image_keys:
-                out_path = _encode_episode_key(
-                    args.root,
-                    meta,
-                    ep_id,
-                    image_key,
-                    static_dir,
-                    args.max_frames,
-                    bool(args.overwrite),
-                )
-                done += 1
-                print_progress(done)
-                if out_path is not None:
-                    logging.info("Prepared %s", out_path)
-        if args.prepare_csv:
-            ds = args.downsample if args.downsample and args.downsample > 1 else 1
-            csv_path = csv_dir / f"episode_{ep_id:06d}_ds{ds}.csv"
-            if _write_episode_csv(
-                args.root,
-                meta,
-                ep_id,
-                csv_path,
-                args.max_frames,
-                args.downsample,
-                bool(args.overwrite),
-            ):
-                logging.info("Prepared %s", csv_path)
-            if not args.prepare_videos:
-                done += 1
-                print_progress(done)
-    if total > 0:
-        sys.stdout.write("\n")
+                    if args.prepare_csv:
+                        ds = args.downsample if args.downsample and args.downsample > 1 else 1
+                        csv_path = csv_dir / f"episode_{ep_id:06d}_ds{ds}.csv"
+                        _write_episode_csv(
+                            args.root,
+                            meta,
+                            ep_id,
+                            csv_path,
+                            args.max_frames,
+                            args.downsample,
+                            overwrite,
+                        )
+                    pbar.update(1)
+        else:
+            logging.info("No precompute tasks selected. Skip prepare stage.")
+    else:
+        logging.info("Detected all precomputed files in '%s'. Skip prepare stage.", static_dir)
+
+    if args.run_visualize:
+        logging.info("Launching visualize_dataset_html with output dir: %s", output_dir)
+        _run_visualize_dataset_html(
+            root=args.root,
+            repo_id=repo_id,
+            output_dir=output_dir,
+            episodes=args.episodes,
+            max_frames=args.max_frames,
+            downsample=args.downsample,
+            precomputed_only=bool(args.precomputed_only),
+            serve=bool(args.serve),
+            host=args.host,
+            port=args.port,
+        )
 
 
 if __name__ == "__main__":

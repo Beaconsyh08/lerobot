@@ -1,11 +1,16 @@
-1. 提前生成视频文件
-<video_path> 是视频文件的保存路径，需要起名以 `local_` 开头，如 `local_test_haha`
-路径建议使用绝对路径
+一条命令完成预计算 + 网页展示（默认 `prepare-csv=1`、`precomputed-only=1`）：
 ```shell
-python lerobot/scripts/prepare_videos_from_images.py --root <data_path> --output-dir <video_path> --prepare-csv 1 --downsample 5
+python lerobot/scripts/prepare_videos_from_images.py --root <data_path>
 ```
 
-2. 运行网页显示
 ```shell
-python lerobot/scripts/visualize_dataset_html.py --root <data_path> --output-dir <video_path> --precomputed-only 1 --downsample 5
+python lerobot/scripts/prepare_videos_from_images.py --root /DATA/disk0/huggingface/lerobot/no_action_0_1
 ```
+
+默认 `--output-dir` 会自动生成为数据目录同级路径：
+- 规则：`<root_parent>/local_vis_<root_name>`
+- 示例：
+  - `--root /DATA/disk0/huggingface/lerobot/no_action_0_1`
+  - 输出目录：`/DATA/disk0/huggingface/lerobot/local_vis_no_action_0_1`
+
+如果第一步预计算文件（视频+CSV）已经存在，会自动跳过预计算，直接启动网页展示。

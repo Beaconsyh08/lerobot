@@ -14,7 +14,7 @@
 <!-- Use [Alpin.js](https://alpinejs.dev), a lightweight and easy to learn JS framework -->
 <!-- Use [tailwindcss](https://tailwindcss.com/), CSS classes for styling html -->
 <!-- Use [dygraphs](https://dygraphs.com/), a lightweight JS charting library -->
-<body class="flex flex-col md:flex-row h-screen max-h-screen bg-slate-950 text-gray-200" x-data="createAlpineData()">
+<body class="flex flex-col md:flex-row h-screen max-h-screen overflow-hidden bg-slate-950 text-gray-200" x-data="createAlpineData()">
     <!-- Sidebar -->
     <div x-ref="sidebar" class="bg-slate-900 p-5 break-words overflow-y-auto shrink-0 md:shrink md:w-60 md:max-h-screen">
         <a href="https://github.com/huggingface/lerobot" target="_blank" class="hidden md:block">
@@ -98,13 +98,18 @@
     </button>
 
     <!-- Content -->
-    <div class="max-h-screen flex flex-col gap-4 overflow-y-auto md:flex-1">
-        <h1 class="text-xl font-bold mt-4 font-mono">
-            Episode {{ episode_id }}
-        </h1>
+    <div class="max-h-screen md:flex-1 min-h-0 flex flex-col gap-2 p-2 md:p-3 overflow-hidden">
+        <div class="flex items-center justify-between gap-3 shrink-0">
+            <h1 class="text-lg md:text-xl font-bold font-mono">
+                Episode {{ episode_id }}
+            </h1>
+            <div class="text-xs hidden md:block text-gray-400">
+                Hotkeys: <span class="font-mono">Space</span> play/pause, <span class="font-mono">Arrow Left</span>/<span class="font-mono">Arrow Right</span> slower/faster, <span class="font-mono">Arrow Down</span>/<span class="font-mono">Arrow Up</span> next/prev episode
+            </div>
+        </div>
 
         <!-- Error message -->
-        <div class="font-medium text-orange-700 hidden" :class="{ 'hidden': !videoCodecError }">
+        <div class="font-medium text-orange-700 hidden text-xs rounded border border-orange-700/40 p-2 shrink-0" :class="{ 'hidden': !videoCodecError }">
             <template x-if="videoCodecHint === 'av1'">
                 <div>
                     <p>Videos could NOT play because <a href="https://en.wikipedia.org/wiki/AV1" target="_blank" class="underline">AV1</a> decoding is not available on your browser.</p>
@@ -122,274 +127,266 @@
             </template>
         </div>
 
-        <div class="flex flex-wrap gap-6 items-start">
-            <div class="flex-1 min-w-[20rem]">
-                {% if videos_info|length > 0 %}
-                <!-- Videos -->
-                <div  class="max-w-32 relative text-sm mb-4 select-none"
-                    @click.outside="isVideosDropdownOpen = false">
-                    <div
-                        @click="isVideosDropdownOpen = !isVideosDropdownOpen"
-                        class="p-2 border border-slate-500 rounded flex justify-between items-center cursor-pointer"
-                    >
-                    <span class="truncate">filter videos</span>
-                    <div class="transition-transform" :class="{ 'rotate-180': isVideosDropdownOpen }">🔽</div>
+        <div class="grid grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3 flex-1 min-h-0">
+            <div class="min-h-0 rounded-lg border border-slate-700 bg-slate-950/40 p-2 overflow-hidden flex flex-col gap-2">
+                <div class="flex items-start justify-between gap-2">
+                    {% if language_instruction %}
+                    <div class="max-w-[72%] rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-200 leading-snug">
+                        <span class="mr-2 font-semibold uppercase tracking-wide text-[11px] text-emerald-300">Instruction</span>
+                        <span class="font-medium">
+                            {% if language_instruction is string %}
+                            {{ language_instruction | replace('[', '') | replace(']', '') | replace("'", "") }}
+                            {% else %}
+                            {{ language_instruction | join(', ') }}
+                            {% endif %}
+                        </span>
                     </div>
-
-                    <div x-show="isVideosDropdownOpen"
-                        class="absolute mt-1 border border-slate-500 rounded shadow-lg z-10">
-                    <div>
-                        <template x-for="option in videosKeys" :key="option">
-                        <div
-                            @click="videosKeysSelected = videosKeysSelected.includes(option) ? videosKeysSelected.filter(v => v !== option) : [...videosKeysSelected, option]"
-                            class="p-2 cursor-pointer bg-slate-900"
-                            :class="{ 'bg-slate-700': videosKeysSelected.includes(option) }"
-                            x-text="option"
-                        ></div>
-                        </template>
-                    </div>
+                    {% endif %}
+                    <div class="ml-auto flex gap-1 text-2xl items-center shrink-0 overflow-x-auto whitespace-nowrap" x-show="(nVideos > 0 || (videos && videos.length > 0)) && !videoCodecError">
+                        <button x-ref="btnPlay" class="-rotate-90" title="Play. Toggle with Space" @click="() => {
+                            videos.forEach(video => video.play());
+                            $refs.btnPlay.classList.toggle('hidden');
+                            $refs.btnPause.classList.toggle('hidden');
+                        }">🔽</button>
+                        <button x-ref="btnPause" class="hidden" title="Pause. Toggle with Space" @click="() => {
+                            videos.forEach(video => video.pause());
+                            $refs.btnPlay.classList.toggle('hidden');
+                            $refs.btnPause.classList.toggle('hidden');
+                        }">⏸️</button>
+                        <button title="Jump backward 5 seconds"
+                            @click="() => (videos.forEach(video => (video.currentTime -= 5)))">⏪</button>
+                        <button title="Jump forward 5 seconds"
+                            @click="() => (videos.forEach(video => (video.currentTime += 5)))">⏩</button>
+                        <button title="Rewind from start"
+                            @click="() => (videos.forEach(video => (video.currentTime = 0.0)))">↩️</button>
+                        <input x-ref="slider" max="100" min="0" step="1" type="range" value="0" class="w-44 md:w-56 mx-2" @input="() => {
+                            const sliderValue = $refs.slider.value;
+                            videos.forEach(video => {
+                                const time = (video.duration * sliderValue) / 100;
+                                video.currentTime = time;
+                            });
+                        }" />
+                        <div x-ref="timer" class="font-mono text-xs border border-slate-500 rounded-lg px-1 py-0.5 shrink-0">0:00 /
+                            0:00
+                        </div>
+                        <div class="ml-2 flex items-center gap-1 text-xs text-gray-300">
+                            <span class="font-mono">Speed</span>
+                            <template x-for="rate in playbackRates" :key="rate">
+                                <button
+                                    @click="setPlaybackRate(rate)"
+                                    class="px-2 py-1 rounded border border-slate-500 font-mono"
+                                    :class="playbackRate === rate ? 'bg-slate-600 text-white' : 'bg-slate-900 hover:bg-slate-700'"
+                                    x-text="`${rate}x`"
+                                ></button>
+                            </template>
+                        </div>
                     </div>
                 </div>
 
-                <div class="flex flex-wrap gap-x-4 gap-y-6">
-                    {% for video_info in videos_info %}
-                    <div x-show="!videoCodecError && videosKeysSelected.includes('{{ video_info.filename }}')" class="max-w-[32rem] md:max-w-[36rem] relative">
-                        <p class="absolute inset-x-0 -top-4 text-sm text-gray-300 bg-gray-800 px-2 rounded-t-xl truncate">{{ video_info.filename }}</p>
-                        <video muted loop type="video/mp4" class="object-contain w-full h-full" @canplaythrough="videoCanPlay" @timeupdate="() => {
-                            if (video.duration) {
-                              if (!dygraphLeftA) {
-                                return;
-                              }
-                              const time = video.currentTime;
-                              const pc = (100 / video.duration) * time;
-                              $refs.slider.value = pc;
-                              dygraphTime = time;
-                              const rows = dygraphLeftA.numRows();
-                              if (!rows) {
-                                return;
-                              }
-                              dygraphIndex = Math.floor(pc * rows / 100);
-                              if (dygraphLeftA) dygraphLeftA.setSelection(dygraphIndex, undefined, true, true);
-                              if (dygraphLeftB) dygraphLeftB.setSelection(dygraphIndex, undefined, true, true);
-                              if (dygraphRightA) dygraphRightA.setSelection(dygraphIndex, undefined, true, true);
-                              if (dygraphRightB) dygraphRightB.setSelection(dygraphIndex, undefined, true, true);
-                              if (dygraphGripperFlag) dygraphGripperFlag.setSelection(dygraphIndex, undefined, true, true);
+                {% if videos_info|length > 0 %}
+                <div class="min-h-0 flex-1">
+                    <div class="grid min-h-0 h-full grid-cols-3 gap-2 overflow-hidden">
+                        {% for video_info in videos_info %}
+                        <div x-show="!videoCodecError" class="relative h-full min-h-0 min-w-0 rounded border border-slate-700 bg-slate-900/50 p-1">
+                            <p class="absolute inset-x-2 top-1 text-xs text-gray-300 bg-gray-800/80 px-2 rounded truncate z-10">{{ video_info.filename }}</p>
+                            <video data-video-label="{{ video_info.filename }}" muted loop type="video/mp4" class="object-contain w-full h-full min-h-0 pt-5 cursor-zoom-in" title="Click to enlarge" @click.stop="openZoomVideoFromElement($event.currentTarget)" @canplaythrough="videoCanPlay($event)" @timeupdate="() => {
+                                if (video.duration) {
+                                  const graph = dygraphArmJoints || dygraphGripperFlag;
+                                  if (!graph) {
+                                    return;
+                                  }
+                                  const time = video.currentTime;
+                                  const pc = (100 / video.duration) * time;
+                                  $refs.slider.value = pc;
+                                  dygraphTime = time;
+                                  const rows = graph.numRows();
+                                  if (!rows) {
+                                    return;
+                                  }
+                                  dygraphIndex = Math.min(rows - 1, Math.max(0, Math.floor(pc * rows / 100)));
+                                  if (dygraphArmJoints) dygraphArmJoints.setSelection(dygraphIndex, undefined, true, true);
+                                  if (dygraphGripperFlag) dygraphGripperFlag.setSelection(dygraphIndex, undefined, true, true);
 
-                              $refs.timer.textContent = formatTime(time) + ' / ' + formatTime(video.duration);
+                                  $refs.timer.textContent = formatTime(time) + ' / ' + formatTime(video.duration);
 
-                              if (!isLoading) {
-                                updateTimeQuery(time.toFixed(2));
-                              }
-                            }
-                        }" @ended="() => {
-                            $refs.btnPlay.classList.remove('hidden');
-                            $refs.btnPause.classList.add('hidden');
-                        }"
-                    @loadedmetadata="() => {
-                        $refs.timer.textContent = formatTime(0) + ' / ' + formatTime(video.duration);
-                        const fallbackDuration = (fps && episodeLength > 0) ? (episodeLength / fps) : 0;
-                        const targetDuration = Math.max(video.duration || 0, fallbackDuration);
-                        extendGraphToDuration(targetDuration);
-                    }">
-                            <source src="{{ video_info.url }}" type="video/mp4">
-                            Your browser does not support the video tag.
-                        </video>
+                                  if (!isLoading) {
+                                    updateTimeQuery(time.toFixed(2));
+                                  }
+                                }
+                            }" @ended="() => {
+                                $refs.btnPlay.classList.remove('hidden');
+                                $refs.btnPause.classList.add('hidden');
+                            }"
+                        @loadedmetadata="() => {
+                            $refs.timer.textContent = formatTime(0) + ' / ' + formatTime(video.duration);
+                            const fallbackDuration = (fps && episodeLength > 0) ? (episodeLength / fps) : 0;
+                            const targetDuration = Math.max(video.duration || 0, fallbackDuration);
+                            extendGraphToDuration(targetDuration);
+                        }">
+                                <source src="{{ video_info.url }}" type="video/mp4">
+                                Your browser does not support the video tag.
+                            </video>
+                        </div>
+                        {% endfor %}
                     </div>
-                    {% endfor %}
                 </div>
                 {% else %}
-                <p class="font-medium mt-2 text-gray-400">
-                    No videos available for this dataset.
-                </p>
+                <div class="flex-1 min-h-0 flex items-center justify-center text-sm text-gray-400">
+                    No video streams available.
+                </div>
                 {% endif %}
+            </div>
 
-                {% if image_keys|length > 0 %}
-                <!-- Images -->
-                <div class="flex flex-wrap gap-x-2 gap-y-6">
-                    <template x-for="imageKey in imageKeys" :key="imageKey">
-                        <div class="max-w-96 relative">
-                            <p class="absolute inset-x-0 -top-4 text-sm text-gray-300 bg-gray-800 px-2 rounded-t-xl truncate" x-text="imageKey"></p>
-                            <img :src="imageUrls[imageKey]" @load="onImageLoaded" class="object-contain w-full h-full bg-slate-900" />
+            <div class="min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_24rem] gap-3">
+                <div class="min-h-0 rounded-lg border border-slate-700 bg-slate-950/40 p-2 overflow-hidden flex flex-col">
+                    <div class="max-w-56 relative text-sm mb-2 select-none" @click.outside="isGroupDropdownOpen = false">
+                        <div
+                            @click="isGroupDropdownOpen = !isGroupDropdownOpen"
+                            class="p-2 border border-slate-500 rounded flex justify-between items-center cursor-pointer bg-slate-900"
+                        >
+                            <span class="truncate">filter joint groups</span>
+                            <div class="transition-transform" :class="{ 'rotate-180': isGroupDropdownOpen }">🔽</div>
                         </div>
-                    </template>
-                </div>
-                {% endif %}
-            </div>
 
-            <div class="min-w-[20rem] max-w-[28rem]">
-                <table class="text-sm border-collapse border border-slate-700" x-show="currentFrameData">
-                    <thead>
-                        <tr>
-                            <th></th>
-                            <template x-for="(_, colIndex) in Array.from({length: columns.length}, (_, index) => index)">
-                                <th class="border border-slate-700">
-                                    <div class="flex gap-x-2 justify-between px-2">
-                                        <input type="checkbox" :checked="isColumnChecked(colIndex)"
-                                            @change="toggleColumn(colIndex)">
-                                        <p x-text="`${columns[colIndex].key}`"></p>
-                                    </div>
-                                </th>
+                        <div x-show="isGroupDropdownOpen"
+                            class="absolute mt-1 border border-slate-500 rounded shadow-lg z-10 bg-slate-900 w-full">
+                            <template x-for="group in jointGroups" :key="group.id">
+                                <div
+                                    @click="toggleGroup(group.id)"
+                                    class="p-2 cursor-pointer"
+                                    :class="{ 'bg-slate-700': group.enabled }"
+                                >
+                                    <span x-text="group.label"></span>
+                                </div>
                             </template>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <template x-for="(row, rowIndex) in rows">
-                            <tr class="odd:bg-gray-800 even:bg-gray-900">
-                                <td class="border border-slate-700">
-                                    <div class="flex gap-x-2 max-w-64 font-semibold px-1 break-all">
-                                        <input type="checkbox" :checked="isRowChecked(rowIndex)"
-                                            @change="toggleRow(rowIndex)">
-                                    </div>
-                                </td>
-                                <template x-for="(cell, colIndex) in row">
-                                    <td x-show="cell" class="border border-slate-700">
-                                        <div class="flex gap-x-2 justify-between px-2" :class="{ 'hidden': cell.isNull }">
-                                            <div class="flex gap-x-2">
-                                                <input type="checkbox" x-model="cell.checked" @change="syncCheckedFromFrame()">
-                                                <span x-text="`${!cell.isNull ? cell.label : null}`"></span>
-                                            </div>
-                                            <span class="w-14 text-right" x-text="`${!cell.isNull ? (typeof cell.value === 'number' ? cell.value.toFixed(2) : cell.value) : null}`"
-                                                :style="`color: ${cell.color}`"></span>
-                                        </div>
-                                    </td>
-                                </template>
-                            </tr>
-                        </template>
-                    </tbody>
-                </table>
-
-                <div id="labels" class="hidden">
-                </div>
-
-                {% if ignored_columns|length > 0 %}
-                <div class="m-2 text-orange-700 max-w-96">
-                    Columns {{ ignored_columns }} are NOT shown since the visualizer currently does not support 2D or 3D data.
-                </div>
-                {% endif %}
-            </div>
-        </div>
-
-        <!-- Language instruction -->
-        {% if language_instruction %}
-        <p class="font-medium mt-2">
-            Language Instruction: <span class="italic">{{ language_instruction }}</span>
-        </p>
-        {% endif %}
-
-        <!-- Shortcuts info -->
-        <div class="text-sm hidden md:block">
-            Hotkeys: <span class="font-mono">Space</span> to pause/unpause, <span class="font-mono">Arrow Down</span> to go to next episode, <span class="font-mono">Arrow Up</span> to go to previous episode.
-        </div>
-
-        <!-- Controllers -->
-        <div class="flex gap-1 text-3xl items-center" x-show="nVideos > 0">
-            <button x-ref="btnPlay" class="-rotate-90" class="-rotate-90" title="Play. Toggle with Space" @click="() => {
-                videos.forEach(video => video.play());
-                $refs.btnPlay.classList.toggle('hidden');
-                $refs.btnPause.classList.toggle('hidden');
-            }">🔽</button>
-            <button x-ref="btnPause" class="hidden" title="Pause. Toggle with Space" @click="() => {
-                videos.forEach(video => video.pause());
-                $refs.btnPlay.classList.toggle('hidden');
-                $refs.btnPause.classList.toggle('hidden');
-            }">⏸️</button>
-            <button title="Jump backward 5 seconds"
-                @click="() => (videos.forEach(video => (video.currentTime -= 5)))">⏪</button>
-            <button title="Jump forward 5 seconds"
-                @click="() => (videos.forEach(video => (video.currentTime += 5)))">⏩</button>
-            <button title="Rewind from start"
-                @click="() => (videos.forEach(video => (video.currentTime = 0.0)))">↩️</button>
-            <input x-ref="slider" max="100" min="0" step="1" type="range" value="0" class="w-80 mx-2" @input="() => {
-                const sliderValue = $refs.slider.value;
-                videos.forEach(video => {
-                    const time = (video.duration * sliderValue) / 100;
-                    video.currentTime = time;
-                });
-            }" />
-            <div x-ref="timer" class="font-mono text-sm border border-slate-500 rounded-lg px-1 py-0.5 shrink-0">0:00 /
-                0:00
-            </div>
-        </div>
-
-        <!-- Graphs -->
-        <div class="flex gap-4 mb-4 flex-wrap">
-            <div class="w-full">
-                <div class="max-w-56 relative text-sm mb-2 select-none" @click.outside="isGroupDropdownOpen = false">
-                    <div
-                        @click="isGroupDropdownOpen = !isGroupDropdownOpen"
-                        class="p-2 border border-slate-500 rounded flex justify-between items-center cursor-pointer bg-slate-900"
-                    >
-                        <span class="truncate">filter joint groups</span>
-                        <div class="transition-transform" :class="{ 'rotate-180': isGroupDropdownOpen }">🔽</div>
+                        </div>
                     </div>
 
-                    <div x-show="isGroupDropdownOpen"
-                        class="absolute mt-1 border border-slate-500 rounded shadow-lg z-10 bg-slate-900 w-full">
-                        <template x-for="group in jointGroups" :key="group.id">
-                            <div
-                                @click="toggleGroup(group.id)"
-                                class="p-2 cursor-pointer"
-                                :class="{ 'bg-slate-700': group.enabled }"
-                            >
-                                <span x-text="group.label"></span>
+                    <div class="grid grid-cols-1 2xl:grid-cols-2 auto-rows-fr gap-2 flex-1 min-h-0">
+                        <div class="min-h-0 rounded border border-slate-800 p-2 bg-slate-900/30 flex flex-col">
+                            <p class="text-xs font-medium text-gray-300 mb-1">Left/Right Arm Joint Groups A+B (Combined)</p>
+                            <div id="graph-arm-joints" class="flex-1 min-h-0" @mouseleave="() => {
+                                if (dygraphArmJoints) {
+                                    dygraphArmJoints.setSelection(dygraphIndex, undefined, true, true);
+                                }
+                                if (video) {
+                                    dygraphTime = video.currentTime;
+                                }
+                            }"></div>
+                        </div>
+                        <div class="min-h-0 rounded border border-slate-800 p-2 bg-slate-900/30 flex flex-col">
+                            <p class="text-xs font-medium text-gray-300 mb-1">Left Gripper / Right Gripper / Flag</p>
+                            <div id="graph-gripper-flag" class="flex-1 min-h-0" @mouseleave="() => {
+                                if (dygraphGripperFlag) {
+                                    dygraphGripperFlag.setSelection(dygraphIndex, undefined, true, true);
+                                }
+                                if (video) {
+                                    dygraphTime = video.currentTime;
+                                }
+                            }"></div>
+                        </div>
+                    </div>
+                    <p x-ref="graphTimer" class="font-mono text-xs mt-1"
+                        x-init="$watch('dygraphTime', value => ($refs.graphTimer.innerText = `Time: ${dygraphTime.toFixed(2)}s`))">
+                        Time: 0.00s
+                    </p>
+                </div>
+
+                <div class="min-h-0 rounded-lg border border-slate-700 bg-slate-900/40 flex flex-col">
+                <div class="shrink-0 flex items-center justify-between px-3 py-2 border-b border-slate-700">
+                    <p class="text-sm font-semibold">State / Action</p>
+                    <div class="flex gap-1">
+                        <button class="text-xs px-2 py-1 rounded border border-slate-500 hover:bg-slate-700" @click="setAllSeries(true)">All</button>
+                        <button class="text-xs px-2 py-1 rounded border border-slate-500 hover:bg-slate-700" @click="setAllSeries(false)">None</button>
+                    </div>
+                </div>
+
+                <div class="px-3 py-1 text-[10px] text-gray-400 shrink-0">
+                    Compact telemetry panel (`state_i` and `action_i` per row). Toggle checkbox to show/hide a series.
+                </div>
+
+                <div class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
+                    <div class="grid grid-cols-1 gap-1" x-show="currentFrameData">
+                        <div class="grid grid-cols-[2.2rem_minmax(0,1fr)_minmax(0,1fr)] gap-1 px-1 text-[10px] text-gray-400 uppercase tracking-wide sticky top-0 bg-slate-900/90 z-10">
+                            <span>Idx</span>
+                            <span>State</span>
+                            <span>Action</span>
+                        </div>
+
+                        <template x-for="row in stateActionRows" :key="row.index">
+                            <div class="grid grid-cols-[2.2rem_minmax(0,1fr)_minmax(0,1fr)] gap-1 items-stretch text-[10px]">
+                                <div class="flex items-center justify-center rounded border border-slate-700 bg-slate-950/60 font-mono text-gray-300" x-text="row.index"></div>
+
+                                <template x-if="row.stateCell">
+                                    <label :title="row.stateCell.label" class="flex items-center justify-between gap-1 rounded border border-slate-700 bg-slate-950/60 px-1 py-1">
+                                        <div class="flex items-center gap-1 min-w-0">
+                                            <input type="checkbox" x-model="row.stateCell.checked" @change="syncCheckedFromFrame()" class="shrink-0">
+                                            <span class="inline-block w-1.5 h-1.5 rounded-full shrink-0" :style="`background-color: ${row.stateCell.color}`"></span>
+                                        </div>
+                                        <span class="font-mono text-right shrink-0" :style="`color: ${row.stateCell.color}`" x-text="formatCellValue(row.stateCell.value)"></span>
+                                    </label>
+                                </template>
+                                <template x-if="!row.stateCell">
+                                    <div class="flex items-center justify-center rounded border border-slate-800 bg-slate-950/40 text-gray-600">-</div>
+                                </template>
+
+                                <template x-if="row.actionCell">
+                                    <label :title="row.actionCell.label" class="flex items-center justify-between gap-1 rounded border border-slate-700 bg-slate-950/60 px-1 py-1">
+                                        <div class="flex items-center gap-1 min-w-0">
+                                            <input type="checkbox" x-model="row.actionCell.checked" @change="syncCheckedFromFrame()" class="shrink-0">
+                                            <span class="inline-block w-1.5 h-1.5 rounded-full shrink-0" :style="`background-color: ${row.actionCell.color}`"></span>
+                                        </div>
+                                        <span class="font-mono text-right shrink-0" :style="`color: ${row.actionCell.color}`" x-text="formatCellValue(row.actionCell.value)"></span>
+                                    </label>
+                                </template>
+                                <template x-if="!row.actionCell">
+                                    <div class="flex items-center justify-center rounded border border-slate-800 bg-slate-950/40 text-gray-600">-</div>
+                                </template>
+                            </div>
+                        </template>
+
+                        <template x-if="auxiliaryRows.length > 0">
+                            <div class="pt-2 mt-1 border-t border-slate-700">
+                                <p class="px-1 mb-1 text-[10px] uppercase tracking-wide text-gray-500">Other Numeric</p>
+                                <div class="grid grid-cols-1 gap-1">
+                                    <template x-for="cell in auxiliaryRows" :key="cell.label">
+                                        <label class="flex items-center justify-between gap-2 rounded border border-slate-700 bg-slate-950/60 px-2 py-1 text-[10px]">
+                                            <div class="flex items-center gap-1 min-w-0">
+                                                <input type="checkbox" x-model="cell.checked" @change="syncCheckedFromFrame()" class="shrink-0">
+                                                <span class="inline-block w-1.5 h-1.5 rounded-full shrink-0" :style="`background-color: ${cell.color}`"></span>
+                                                <span class="truncate" x-text="cell.label"></span>
+                                            </div>
+                                            <span class="font-mono text-right shrink-0" :style="`color: ${cell.color}`" x-text="formatCellValue(cell.value)"></span>
+                                        </label>
+                                    </template>
+                                </div>
                             </div>
                         </template>
                     </div>
                 </div>
 
-                <div class="flex flex-col gap-4">
-                    <div>
-                        <p class="text-sm font-medium text-gray-300 mb-1">Left Arm Joint Group A</p>
-                        <div id="graph-left-a" @mouseleave="() => {
-                            dygraphLeftA.setSelection(dygraphIndex, undefined, true, true);
-                            if (video) {
-                                dygraphTime = video.currentTime;
-                            }
-                        }"></div>
-                    </div>
-                    <div>
-                        <p class="text-sm font-medium text-gray-300 mb-1">Left Arm Joint Group B</p>
-                        <div id="graph-left-b" @mouseleave="() => {
-                            dygraphLeftB.setSelection(dygraphIndex, undefined, true, true);
-                            if (video) {
-                                dygraphTime = video.currentTime;
-                            }
-                        }"></div>
-                    </div>
-                    <div>
-                        <p class="text-sm font-medium text-gray-300 mb-1">Right Arm Joint Group A</p>
-                        <div id="graph-right-a" @mouseleave="() => {
-                            dygraphRightA.setSelection(dygraphIndex, undefined, true, true);
-                            if (video) {
-                                dygraphTime = video.currentTime;
-                            }
-                        }"></div>
-                    </div>
-                    <div>
-                        <p class="text-sm font-medium text-gray-300 mb-1">Right Arm Joint Group B</p>
-                        <div id="graph-right-b" @mouseleave="() => {
-                            dygraphRightB.setSelection(dygraphIndex, undefined, true, true);
-                            if (video) {
-                                dygraphTime = video.currentTime;
-                            }
-                        }"></div>
-                    </div>
-                    <div>
-                        <p class="text-sm font-medium text-gray-300 mb-1">Left Gripper / Right Gripper / Flag</p>
-                        <div id="graph-gripper-flag" @mouseleave="() => {
-                            dygraphGripperFlag.setSelection(dygraphIndex, undefined, true, true);
-                            if (video) {
-                                dygraphTime = video.currentTime;
-                            }
-                        }"></div>
-                    </div>
-                </div>
-                <p x-ref="graphTimer" class="font-mono ml-2 mt-4"
-                    x-init="$watch('dygraphTime', value => ($refs.graphTimer.innerText = `Time: ${dygraphTime.toFixed(2)}s`))">
-                    Time: 0.00s
-                </p>
-            </div>
+                <div id="labels" class="hidden"></div>
 
+                {% if ignored_columns|length > 0 %}
+                <div class="shrink-0 m-2 text-orange-700 text-xs">
+                    Columns {{ ignored_columns }} are NOT shown since the visualizer currently does not support 2D or 3D data.
+                </div>
+                {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="isZoomOpen" class="fixed inset-0 z-50 flex items-center justify-center p-3 md:p-5" x-transition.opacity>
+        <div class="absolute inset-0 bg-black/80" @click="closeZoomVideo()"></div>
+        <div class="relative z-10 w-[min(96vw,1280px)] h-[min(92vh,840px)] rounded-lg border border-slate-700 bg-slate-950 shadow-2xl flex flex-col overflow-hidden">
+            <div class="flex items-center justify-between gap-3 px-3 py-2 border-b border-slate-700 bg-slate-900/80">
+                <p class="text-sm font-mono text-gray-200 truncate" x-text="zoomVideoLabel || 'Zoom Video'"></p>
+                <button class="text-xs px-2 py-1 rounded border border-slate-500 hover:bg-slate-700" @click="closeZoomVideo()">Close</button>
+            </div>
+            <div class="flex-1 min-h-0 p-2">
+                <video x-ref="zoomVideo" :src="zoomVideoUrl" class="w-full h-full object-contain rounded bg-black" controls autoplay loop muted playsinline></video>
+            </div>
         </div>
     </div>
 
@@ -405,10 +402,7 @@
         function createAlpineData() {
             return {
                 // state
-                dygraphLeftA: null,
-                dygraphLeftB: null,
-                dygraphRightA: null,
-                dygraphRightB: null,
+                dygraphArmJoints: null,
                 dygraphGripperFlag: null,
                 currentFrameData: null,
                 checked: [],
@@ -418,6 +412,7 @@
                 video: null,
                 colors: null,
                 colorByLabel: {},
+                labelsNoTime: [],
                 baseGraphData: null,
                 pendingGraphDuration: null,
                 nVideos: {{ videos_info | length }},
@@ -437,10 +432,22 @@
                 imageLoadCount: 0,
                 _lastImageIndex: null,
                 _imageTimer: null,
+                _onSpeedStep: null,
+                _onCloseZoom: null,
+                _pausedForZoom: [],
+                leftASet: null,
+                leftBSet: null,
+                rightASet: null,
+                rightBSet: null,
+                gripperFlagSet: null,
+                isZoomOpen: false,
+                zoomVideoUrl: "",
+                zoomVideoLabel: "",
                 leftAMask: [],
                 leftBMask: [],
                 rightAMask: [],
                 rightBMask: [],
+                armJointMask: [],
                 gripperFlagMask: [],
                 isGroupDropdownOpen: false,
                 jointGroups: [
@@ -450,11 +457,19 @@
                     { id: "right_b", label: "Right Arm Joint Group B", enabled: true },
                     { id: "gripper_flag", label: "Left/Right Gripper + Flag", enabled: true },
                 ],
+                playbackRates: [0.25, 0.5, 1, 2, 3, 5],
+                playbackRate: 1,
                 columns: {{ columns | tojson }},
-
                 // alpine initialization
                 init() {
-                    // check if videos can play
+                    const csvUrl = "{{ csv_url }}";
+
+                    // process CSV data
+                    this.videos = document.querySelectorAll('video');
+                    this.video = this.videos[0];
+                    this.nVideos = this.videos.length;
+
+                    // check if rendered videos can play
                     if (this.nVideos > 0) {
                         const dummyVideo = document.createElement('video');
                         if (this.videoCodecHint === 'av1') {
@@ -469,13 +484,18 @@
                             }
                         }
                     }
-                    this.videosKeysSelected = this.videosKeys.map(opt => opt)
-
-                    const csvUrl = "{{ csv_url }}";
-
-                    // process CSV data
-                    this.videos = document.querySelectorAll('video');
-                    this.video = this.videos[0];
+                    this.setPlaybackRate(this.playbackRate);
+                    this._onSpeedStep = (event) => {
+                        if (!event || !event.detail || typeof event.detail.step !== "number") {
+                            return;
+                        }
+                        this.stepPlaybackRate(event.detail.step);
+                    };
+                    this._onCloseZoom = () => {
+                        this.closeZoomVideo();
+                    };
+                    window.addEventListener('visualizer-speed-step', this._onSpeedStep);
+                    window.addEventListener('visualizer-close-zoom', this._onCloseZoom);
                     if (this.imageKeys.length > 0) {
                         const imageIndex = this.imageKeys.indexOf("image");
                         const wristIndex = this.imageKeys.indexOf("left_wrist_image");
@@ -486,7 +506,10 @@
                         }
                         this.updateImages(0);
                     }
+                    this.isLoading = false;
+                    this.loadingDone = true;
                     const labels = ["timestamp", ...this.columns.flatMap(c => c.value)];
+                    this.labelsNoTime = labels.slice(1);
                     const stateCol = this.columns.find(c => c.key === "state");
                     const actionCol = this.columns.find(c => c.key === "action");
                     const stateLabels = stateCol ? stateCol.value : [];
@@ -497,6 +520,11 @@
                     const rightASet = new Set();
                     const rightBSet = new Set();
                     const gripperFlagSet = new Set();
+                    this.leftASet = leftASet;
+                    this.leftBSet = leftBSet;
+                    this.rightASet = rightASet;
+                    this.rightBSet = rightBSet;
+                    this.gripperFlagSet = gripperFlagSet;
 
                     const leftAIdx = new Set([0, 1, 2, 6]);
                     const leftBIdx = new Set([3, 4, 5]);
@@ -537,13 +565,13 @@
                     this.leftBMask = buildVisibility(leftBSet);
                     this.rightAMask = buildVisibility(rightASet);
                     this.rightBMask = buildVisibility(rightBSet);
+                    this.armJointMask = labels.slice(1).map((_, idx) => (
+                        this.leftAMask[idx] || this.leftBMask[idx] || this.rightAMask[idx] || this.rightBMask[idx]
+                    ));
                     this.gripperFlagMask = buildVisibility(gripperFlagSet);
 
                     const syncSelection = (row) => {
-                        if (this.dygraphLeftA) this.dygraphLeftA.setSelection(row, undefined, true, true);
-                        if (this.dygraphLeftB) this.dygraphLeftB.setSelection(row, undefined, true, true);
-                        if (this.dygraphRightA) this.dygraphRightA.setSelection(row, undefined, true, true);
-                        if (this.dygraphRightB) this.dygraphRightB.setSelection(row, undefined, true, true);
+                        if (this.dygraphArmJoints) this.dygraphArmJoints.setSelection(row, undefined, true, true);
                         if (this.dygraphGripperFlag) this.dygraphGripperFlag.setSelection(row, undefined, true, true);
                     };
 
@@ -590,10 +618,10 @@
                         });
                     };
 
+                    const graphHeight = Math.max(160, Math.min(280, Math.floor(window.innerHeight * 0.26)));
                     const commonOptions = {
                         pixelsPerPoint: 0.3,
-                        width: 900,
-                        height: 260,
+                        height: graphHeight,
                         legend: 'always',
                         labelsDiv: document.getElementById('labels'),
                         labelsKMB: false,
@@ -623,16 +651,14 @@
                                 this.colorByLabel = colorByLabel;
                                 this.checked = Array(this.colors.length).fill(true);
 
-                                if (this.dygraphLeftA) this.dygraphLeftA.updateOptions({ colors, series: seriesOptions });
-                                if (this.dygraphLeftB) this.dygraphLeftB.updateOptions({ colors, series: seriesOptions });
-                                if (this.dygraphRightA) this.dygraphRightA.updateOptions({ colors, series: seriesOptions });
-                                if (this.dygraphRightB) this.dygraphRightB.updateOptions({ colors, series: seriesOptions });
+                                if (this.dygraphArmJoints) this.dygraphArmJoints.updateOptions({ colors, series: seriesOptions });
                                 if (this.dygraphGripperFlag) this.dygraphGripperFlag.updateOptions({ colors, series: seriesOptions });
 
-                                this.updateTableValues();
-
-                                if (!this.baseGraphData && this.dygraphLeftA) {
-                                    this.baseGraphData = this.dygraphLeftA.rawData_.map(row => row.slice());
+                                if (!this.baseGraphData) {
+                                    const baseGraph = this.dygraphArmJoints || this.dygraphGripperFlag || dygraph;
+                                    if (baseGraph) {
+                                        this.baseGraphData = baseGraph.rawData_.map(row => row.slice());
+                                    }
                                     if (this.pendingGraphDuration !== null) {
                                         this.extendGraphToDuration(this.pendingGraphDuration);
                                         this.pendingGraphDuration = null;
@@ -648,32 +674,22 @@
                                 let params = new URLSearchParams(url.search);
                                 let time = params.get("t");
                                 if(time){
-                                    time = parseFloat(time);
-                                    this.videos.forEach(video => (video.currentTime = time));
+                                    const parsedTime = parseFloat(time);
+                                    if (!isNaN(parsedTime)) {
+                                        this.dygraphTime = parsedTime;
+                                        this.videos.forEach(video => (video.currentTime = parsedTime));
+                                    }
                                 }
+                                this.updateTableValues(this.dygraphTime, dygraph);
+                                this.applyVisibility();
                             }
                         },
                     };
 
-                    this.dygraphLeftA = new Dygraph(
-                        document.getElementById("graph-left-a"),
+                    this.dygraphArmJoints = new Dygraph(
+                        document.getElementById("graph-arm-joints"),
                         csvUrl,
-                        { ...commonOptions, visibility: this.leftAMask },
-                    );
-                    this.dygraphLeftB = new Dygraph(
-                        document.getElementById("graph-left-b"),
-                        csvUrl,
-                        { ...commonOptions, visibility: this.leftBMask },
-                    );
-                    this.dygraphRightA = new Dygraph(
-                        document.getElementById("graph-right-a"),
-                        csvUrl,
-                        { ...commonOptions, visibility: this.rightAMask },
-                    );
-                    this.dygraphRightB = new Dygraph(
-                        document.getElementById("graph-right-b"),
-                        csvUrl,
-                        { ...commonOptions, visibility: this.rightBMask },
+                        { ...commonOptions, visibility: this.armJointMask },
                     );
                     this.dygraphGripperFlag = new Dygraph(
                         document.getElementById("graph-gripper-flag"),
@@ -686,6 +702,47 @@
 
                 // turn dygraph's 1D data (at a given time t) to 2D data that whose columns names are defined in this.columnNames.
                 // 2d data view is used to create html table element.
+                get stateActionRows() {
+                    if (!this.currentFrameData) {
+                        return [];
+                    }
+                    const stateByIndex = new Map();
+                    const actionByIndex = new Map();
+                    const stateRegex = /^state_(\d+)$/;
+                    const actionRegex = /^action_(\d+)$/;
+
+                    for (const cell of this.currentFrameData) {
+                        const stateMatch = cell.label.match(stateRegex);
+                        if (stateMatch) {
+                            stateByIndex.set(parseInt(stateMatch[1], 10), cell);
+                            continue;
+                        }
+                        const actionMatch = cell.label.match(actionRegex);
+                        if (actionMatch) {
+                            actionByIndex.set(parseInt(actionMatch[1], 10), cell);
+                        }
+                    }
+
+                    const allIndices = new Set([...stateByIndex.keys(), ...actionByIndex.keys()]);
+                    return Array.from(allIndices)
+                        .sort((a, b) => a - b)
+                        .map((idx) => ({
+                            index: idx,
+                            stateCell: idx === 16 ? null : (stateByIndex.get(idx) || null),
+                            actionCell: actionByIndex.get(idx) || null,
+                        }));
+                },
+                get auxiliaryRows() {
+                    if (!this.currentFrameData) {
+                        return [];
+                    }
+                    return this.currentFrameData.filter((cell) => (
+                        !/^state_\d+$/.test(cell.label) && !/^action_\d+$/.test(cell.label)
+                    ));
+                },
+                formatCellValue(value) {
+                    return typeof value === "number" ? value.toFixed(2) : value;
+                },
                 get rows() {
                     if (!this.currentFrameData) {
                         return [];
@@ -731,32 +788,53 @@
                 },
 
                 // given time t, update the values in the html table with "data[t]"
-                updateTableValues(time) {
+                updateTableValues(time, graphOverride = null) {
                     if (!this.colors) {
+                        return;
+                    }
+                    const graph = graphOverride || this.dygraphArmJoints || this.dygraphGripperFlag;
+                    if (!graph) {
                         return;
                     }
                     let index = 0;
                     if (this.video && this.video.duration) {
                         let pc = (100 / this.video.duration) * (time === undefined ? this.video.currentTime : time);
                         if (isNaN(pc)) pc = 0;
-                        index = Math.floor(pc * this.dygraphLeftA.numRows() / 100);
+                        const rows = graph.numRows();
+                        if (!rows) {
+                            return;
+                        }
+                        index = Math.floor(pc * rows / 100);
                     } else {
                         const targetTime = time === undefined ? this.dygraphTime : time;
-                        const row = this.dygraphLeftA.getRowForX(targetTime);
+                        const row = graph.getRowForX(targetTime);
                         index = row === null ? 0 : row;
                     }
+                    const maxIndex = graph.rawData_ ? graph.rawData_.length - 1 : -1;
+                    if (maxIndex < 0) {
+                        return;
+                    }
+                    index = Math.min(maxIndex, Math.max(0, index));
                     // slice(1) to remove the timestamp point that we do not need
-                    const labels = this.dygraphLeftA.getLabels().slice(1);
-                    const values = this.dygraphLeftA.rawData_[index].slice(1);
-                    const checkedNew = this.currentFrameData ? this.currentFrameData.map(cell => cell.checked) : Array(
-                        this.colors.length).fill(true);
+                    const labels = graph.getLabels().slice(1);
+                    const values = graph.rawData_[index].slice(1);
+                    const previousCheckedByLabel = {};
+                    if (this.currentFrameData) {
+                        for (const cell of this.currentFrameData) {
+                            previousCheckedByLabel[cell.label] = cell.checked;
+                        }
+                    }
+                    const checkedNew = labels.map((label) => previousCheckedByLabel[label] ?? true);
                     this.currentFrameData = labels.map((label, idx) => ({
                         label,
                         value: values[idx],
                         color: this.colorByLabel[label] || this.colors[idx],
                         checked: checkedNew[idx],
                     }));
-                    const shouldUpdateVisibility = !this.checked.every((value, index) => value === checkedNew[index]);
+                    const shouldUpdateVisibility = (
+                        this.checked.length !== checkedNew.length ||
+                        this.checked.some((value, idx) => value !== checkedNew[idx])
+                    );
                     if (shouldUpdateVisibility) {
                         this.checked = checkedNew;
                         this.applyVisibility();
@@ -818,17 +896,152 @@
                         '0' + seconds : seconds);
                 },
 
-                videoCanPlay() {
+                videoCanPlay(event) {
+                    if (event && event.target) {
+                        event.target.playbackRate = this.playbackRate;
+                    }
                     this.nVideoReadyToPlay += 1;
                     if(this.nVideoReadyToPlay == this.nVideos) {
                         // start autoplay all videos in sync
-                        this.$refs.btnPlay.click();
+                        if (this.$refs.btnPlay) {
+                            this.$refs.btnPlay.click();
+                        }
                     }
                 },
 
-                applyVisibility() {
-                    if (!this.dygraphLeftA) {
+                setPlaybackRate(rate) {
+                    this.playbackRate = rate;
+                    if (!this.videos) {
+                        if (this.$refs.zoomVideo) {
+                            this.$refs.zoomVideo.playbackRate = rate;
+                        }
                         return;
+                    }
+                    this.videos.forEach(video => {
+                        video.playbackRate = rate;
+                    });
+                    if (this.$refs.zoomVideo) {
+                        this.$refs.zoomVideo.playbackRate = rate;
+                    }
+                },
+
+                stepPlaybackRate(step) {
+                    if (!Array.isArray(this.playbackRates) || this.playbackRates.length === 0) {
+                        return;
+                    }
+                    const currentIdx = this.playbackRates.indexOf(this.playbackRate);
+                    const defaultIdx = this.playbackRates.indexOf(1);
+                    const baseIdx = currentIdx === -1 ? (defaultIdx === -1 ? 0 : defaultIdx) : currentIdx;
+                    const nextIdx = Math.max(0, Math.min(this.playbackRates.length - 1, baseIdx + step));
+                    this.setPlaybackRate(this.playbackRates[nextIdx]);
+                },
+
+                openZoomVideoFromElement(sourceVideo) {
+                    if (!sourceVideo) {
+                        return;
+                    }
+                    const sourceNode = sourceVideo.querySelector('source');
+                    const url = sourceVideo.currentSrc || (sourceNode ? sourceNode.src : "");
+                    const label = sourceVideo.dataset.videoLabel || "";
+                    if (!url) {
+                        return;
+                    }
+                    this.openZoomVideo(url, label, sourceVideo);
+                },
+
+                openZoomVideo(url, label, sourceVideo) {
+                    this.zoomVideoUrl = url;
+                    this.zoomVideoLabel = label || "";
+                    this.isZoomOpen = true;
+                    this._pausedForZoom = [];
+                    if (this.videos) {
+                        this.videos.forEach((video, idx) => {
+                            if (!video) {
+                                return;
+                            }
+                            this._pausedForZoom[idx] = video.paused;
+                            if (!video.paused) {
+                                video.pause();
+                            }
+                        });
+                    }
+                    const startTime = sourceVideo && Number.isFinite(sourceVideo.currentTime)
+                        ? sourceVideo.currentTime
+                        : ((this.video && Number.isFinite(this.video.currentTime)) ? this.video.currentTime : 0);
+                    const shouldPlay = sourceVideo ? !sourceVideo.paused : true;
+                    this.$nextTick(() => {
+                        const zoomVideo = this.$refs.zoomVideo;
+                        if (!zoomVideo) {
+                            return;
+                        }
+                        zoomVideo.playbackRate = this.playbackRate;
+                        if (Number.isFinite(startTime)) {
+                            zoomVideo.currentTime = startTime;
+                        }
+                        if (shouldPlay) {
+                            const maybePlay = zoomVideo.play();
+                            if (maybePlay && typeof maybePlay.catch === "function") {
+                                maybePlay.catch(() => {});
+                            }
+                        } else {
+                            zoomVideo.pause();
+                        }
+                    });
+                },
+
+                closeZoomVideo() {
+                    const zoomVideo = this.$refs.zoomVideo;
+                    if (zoomVideo) {
+                        zoomVideo.pause();
+                    }
+                    if (this.videos && Array.isArray(this._pausedForZoom)) {
+                        this.videos.forEach((video, idx) => {
+                            if (!video) {
+                                return;
+                            }
+                            if (this._pausedForZoom[idx] === false) {
+                                const maybePlay = video.play();
+                                if (maybePlay && typeof maybePlay.catch === "function") {
+                                    maybePlay.catch(() => {});
+                                }
+                            }
+                        });
+                    }
+                    this._pausedForZoom = [];
+                    this.isZoomOpen = false;
+                },
+
+                getSeriesLabels() {
+                    const graph = this.dygraphArmJoints || this.dygraphGripperFlag;
+                    if (graph) {
+                        const labels = graph.getLabels().slice(1);
+                        if (labels.length > 0) {
+                            return labels;
+                        }
+                    }
+                    return this.labelsNoTime;
+                },
+
+                setAllSeries(checked) {
+                    if (!this.currentFrameData) {
+                        return;
+                    }
+                    this.currentFrameData.forEach(cell => {
+                        cell.checked = checked;
+                    });
+                    this.syncCheckedFromFrame();
+                },
+
+                applyVisibility() {
+                    if (!this.dygraphArmJoints && !this.dygraphGripperFlag) {
+                        return;
+                    }
+                    const labels = this.getSeriesLabels();
+                    const checkedByLabel = {};
+                    if (this.currentFrameData) {
+                        for (const cell of this.currentFrameData) {
+                            checkedByLabel[cell.label] = cell.checked;
+                        }
                     }
                     const enabled = new Set(this.jointGroups.filter(g => g.enabled).map(g => g.id));
                     const leftAOn = enabled.has("left_a");
@@ -837,18 +1050,33 @@
                     const rightBOn = enabled.has("right_b");
                     const gripperFlagOn = enabled.has("gripper_flag");
 
-                    this.dygraphLeftA.setVisibility(this.checked.map((v, i) => v && leftAOn && this.leftAMask[i]));
-                    this.dygraphLeftB.setVisibility(this.checked.map((v, i) => v && leftBOn && this.leftBMask[i]));
-                    this.dygraphRightA.setVisibility(this.checked.map((v, i) => v && rightAOn && this.rightAMask[i]));
-                    this.dygraphRightB.setVisibility(this.checked.map((v, i) => v && rightBOn && this.rightBMask[i]));
-                    this.dygraphGripperFlag.setVisibility(this.checked.map((v, i) => v && gripperFlagOn && this.gripperFlagMask[i]));
+                    if (this.dygraphArmJoints) {
+                        this.dygraphArmJoints.setVisibility(labels.map((label) => (
+                            (checkedByLabel[label] ?? true) && (
+                                (leftAOn && this.leftASet?.has(label)) ||
+                                (leftBOn && this.leftBSet?.has(label)) ||
+                                (rightAOn && this.rightASet?.has(label)) ||
+                                (rightBOn && this.rightBSet?.has(label))
+                            )
+                        )));
+                    }
+                    if (this.dygraphGripperFlag) {
+                        this.dygraphGripperFlag.setVisibility(
+                            labels.map((label) => (checkedByLabel[label] ?? true) && gripperFlagOn && this.gripperFlagSet?.has(label))
+                        );
+                    }
                 },
 
                 syncCheckedFromFrame() {
                     if (!this.currentFrameData) {
                         return;
                     }
-                    this.checked = this.currentFrameData.map(cell => cell.checked);
+                    const checkedByLabel = {};
+                    for (const cell of this.currentFrameData) {
+                        checkedByLabel[cell.label] = cell.checked;
+                    }
+                    const labels = this.getSeriesLabels();
+                    this.checked = labels.map(label => checkedByLabel[label] ?? true);
                     this.applyVisibility();
                 },
 
@@ -867,7 +1095,7 @@
                     if (!Number.isFinite(targetDuration) || targetDuration <= 0) {
                         return;
                     }
-                    if (!this.baseGraphData || !this.dygraphLeftA) {
+                    if (!this.baseGraphData || (!this.dygraphArmJoints && !this.dygraphGripperFlag)) {
                         this.pendingGraphDuration = targetDuration;
                         return;
                     }
@@ -884,10 +1112,7 @@
                             graph.updateOptions({ file: data, dateWindow: [0, targetDuration] });
                         }
                     };
-                    update(this.dygraphLeftA);
-                    update(this.dygraphLeftB);
-                    update(this.dygraphRightA);
-                    update(this.dygraphRightB);
+                    update(this.dygraphArmJoints);
                     update(this.dygraphGripperFlag);
                 }
             };
@@ -938,12 +1163,27 @@
         window.addEventListener('keydown', (e) => {
             // Use the space bar to play and pause, instead of default action (e.g. scrolling)
             const { keyCode, key } = e;
+            const tagName = e.target && e.target.tagName ? e.target.tagName.toLowerCase() : "";
+            const isEditableTarget = tagName === "input" || tagName === "textarea" || (e.target && e.target.isContentEditable);
+            if (isEditableTarget) {
+                return;
+            }
 
             if (keyCode === 32 || key === ' ') {
                 e.preventDefault();
                 const btnPause = document.querySelector('[x-ref="btnPause"]');
                 const btnPlay = document.querySelector('[x-ref="btnPlay"]');
-                btnPause.classList.contains('hidden') ? btnPlay.click() : btnPause.click();
+                if (btnPause && btnPlay) {
+                    btnPause.classList.contains('hidden') ? btnPlay.click() : btnPause.click();
+                }
+            } else if (key === 'Escape') {
+                e.preventDefault();
+                window.dispatchEvent(new CustomEvent('visualizer-close-zoom'));
+            } else if (key === 'ArrowLeft' || key === 'ArrowRight') {
+                e.preventDefault();
+                window.dispatchEvent(new CustomEvent('visualizer-speed-step', {
+                    detail: { step: key === 'ArrowRight' ? 1 : -1 },
+                }));
             } else if (key === 'ArrowDown' || key === 'ArrowUp') {
                 const episodes = {{ episodes }};  // Access episodes directly from the Jinja template
                 const nextEpisodeId = key === 'ArrowDown' ? {{ episode_id }} + 1 : {{ episode_id }} - 1;

@@ -83,6 +83,7 @@ import pyarrow.parquet as pq
 import cv2
 import shutil
 import subprocess
+from werkzeug.serving import WSGIRequestHandler
 
 from lerobot import available_datasets
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -400,6 +401,27 @@ def _columns_from_csv_header(csv_path: Path) -> list[dict]:
     return [{"key": key, "value": columns[key]} for key in order]
 
 
+def _video_rank(filename: str) -> int:
+    normalized = re.sub(r"[./-]+", "_", (filename or "").lower()).strip("_")
+    tokens = {token for token in normalized.split("_") if token}
+    is_left_wrist = ("left" in tokens and "wrist" in tokens) or "left_wrist" in normalized
+    is_right_wrist = ("right" in tokens and "wrist" in tokens) or "right_wrist" in normalized
+    is_main_image = "image" in tokens and not is_left_wrist and not is_right_wrist
+
+    if is_left_wrist:
+        return 0
+    if is_main_image:
+        return 1
+    if is_right_wrist:
+        return 2
+    return 3
+
+
+def _sort_videos_info(videos_info: list[dict]) -> list[dict]:
+    # Stable sort: keep original order inside each rank bucket.
+    return sorted(videos_info, key=lambda info: _video_rank(info.get("filename", "")))
+
+
 def run_server(
     dataset: LeRobotDataset | IterableNamespace | MetaOnlyDataset | None,
     episodes: list[int] | None,
@@ -413,7 +435,14 @@ def run_server(
     static_folder: Path,
     template_folder: Path,
 ):
+    class QuietRequestHandler(WSGIRequestHandler):
+        def log_request(self, code="-", size="-"):
+            return
+
+    werkzeug_logger = logging.getLogger("werkzeug")
+    werkzeug_logger.setLevel(logging.INFO)
     app = Flask(__name__, static_folder=static_folder.resolve(), template_folder=template_folder.resolve())
+    app.logger.setLevel(logging.ERROR)
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # specifying not to cache
 
     @app.route("/")
@@ -579,6 +608,8 @@ def run_server(
                 image_keys = []
                 prepared_videos = True
 
+        videos_info = _sort_videos_info(videos_info)
+
         if videos_info:
             video_codec_hint = "h264" if prepared_videos else "av1"
         else:
@@ -697,7 +728,7 @@ def run_server(
             gc.collect()
             logging.info("CSV cached: %s", cache_path)
 
-    app.run(host=host, port=port)
+    app.run(host=host, port=port, request_handler=QuietRequestHandler)
 
 
 def get_ep_csv_fname(episode_id: int):
