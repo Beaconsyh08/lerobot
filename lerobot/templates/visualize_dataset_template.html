@@ -465,8 +465,9 @@
                     const csvUrl = "{{ csv_url }}";
 
                     // process CSV data
-                    this.videos = document.querySelectorAll('video');
-                    this.video = this.videos[0];
+                    // Only select camera videos (exclude zoom video which has no src and won't fire canplaythrough)
+                    this.videos = document.querySelectorAll('video[data-video-label]');
+                    this.video = this.videos[0] || null;
                     this.nVideos = this.videos.length;
 
                     // check if rendered videos can play
@@ -483,6 +484,10 @@
                                 this.videoCodecError = true;
                             }
                         }
+                    }
+                    const savedRate = parseFloat(sessionStorage.getItem('lerobot_playback_rate'));
+                    if (savedRate && this.playbackRates.includes(savedRate)) {
+                        this.playbackRate = savedRate;
                     }
                     this.setPlaybackRate(this.playbackRate);
                     this._onSpeedStep = (event) => {
@@ -911,6 +916,7 @@
 
                 setPlaybackRate(rate) {
                     this.playbackRate = rate;
+                    sessionStorage.setItem('lerobot_playback_rate', String(rate));
                     if (!this.videos) {
                         if (this.$refs.zoomVideo) {
                             this.$refs.zoomVideo.playbackRate = rate;
