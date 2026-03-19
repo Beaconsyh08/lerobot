@@ -32,7 +32,7 @@ Example of usage:
 local$ python lerobot/scripts/visualize_dataset_html.py \
     --repo-id lerobot/pusht
 
-local$ open http://localhost:9090
+local$ open http://localhost:9091
 ```
 
 - Visualize a local dataset by its root path:
@@ -40,7 +40,7 @@ local$ open http://localhost:9090
 local$ python lerobot/scripts/visualize_dataset_html.py \
     --root /home/yuhao.song/nfs-share/yuhao.song/datasets/MERGED_04_17_clean
 
-local$ open http://localhost:9090
+local$ open http://localhost:9091
 ```
 
 - Visualize data stored on a distant machine with a local viewer:
@@ -48,8 +48,8 @@ local$ open http://localhost:9090
 distant$ python lerobot/scripts/visualize_dataset_html.py \
     --repo-id lerobot/pusht
 
-local$ ssh -L 9090:localhost:9090 distant  # create a ssh tunnel
-local$ open http://localhost:9090
+local$ ssh -L 9091:localhost:9091 distant  # create a ssh tunnel
+local$ open http://localhost:9091
 ```
 
 - Select episodes to visualize:
@@ -77,7 +77,7 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import requests
-from flask import Flask, abort, redirect, render_template, request, send_file, url_for
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 import pyarrow as pa
 import pyarrow.parquet as pq
 import cv2
@@ -434,6 +434,7 @@ def run_server(
     port: str,
     static_folder: Path,
     template_folder: Path,
+    annotate: bool = False,
 ):
     class QuietRequestHandler(WSGIRequestHandler):
         def log_request(self, code="-", size="-"):
@@ -652,6 +653,24 @@ def run_server(
             ),
             columns=columns,
             ignored_columns=ignored_columns,
+            flagged_url=url_for(
+                "get_flagged_episodes",
+                dataset_namespace=dataset_namespace,
+                dataset_name=dataset_name,
+            ),
+            subtask_url=url_for(
+                "get_subtask_annotations",
+                dataset_namespace=dataset_namespace,
+                dataset_name=dataset_name,
+            ),
+            subtask_merge_url=url_for(
+                "merge_subtask_parquet",
+                dataset_namespace=dataset_namespace,
+                dataset_name=dataset_name,
+            ),
+            annotate_enabled=annotate,
+            issue_episodes=sorted(_load_issue_episodes()),
+            stage_edit_enabled=annotate or (episode_id in _load_issue_episodes()),
         )
 
     @app.route("/<string:dataset_namespace>/<string:dataset_name>/image")
@@ -691,7 +710,7 @@ def run_server(
             cache_path = _get_csv_cache_path(cache_dir, episode_id, downsample, precomputed_only)
             if precomputed_only:
                 if cache_path and cache_path.is_file():
-                    return send_file(cache_path, mimetype="text/csv")
+                    return send_file(cache_path.resolve(), mimetype="text/csv")
                 return (
                     "CSV cache not found. Please precompute with prepare_videos_from_images.py --prepare-csv 1.",
                     404,
@@ -703,10 +722,192 @@ def run_server(
                 ds = downsample if downsample and downsample > 1 else 1
                 cache_path = cache_dir / f"episode_{episode_id:06d}_ds{ds}.csv"
                 cache_path.write_text(csv_string)
-            return send_file(cache_path, mimetype="text/csv")
-        except Exception:
+            return send_file(cache_path.resolve(), mimetype="text/csv")
+        except Exception as exc:
+            tb = traceback.format_exc()
+            print(f"\n=== CSV ERROR episode {episode_id} ===\n{tb}=== END ===\n", flush=True)
             logging.exception("Failed to serve CSV for episode %s", episode_id)
-            return (f"Failed to serve CSV for episode {episode_id}:\n\n{traceback.format_exc()}", 500)
+            return (f"Failed to serve CSV for episode {episode_id}:\n\n{tb}", 500)
+
+    def _flagged_path() -> Path:
+        return static_folder / "flagged_episodes.json"
+
+    def _load_flagged() -> list[int]:
+        p = _flagged_path()
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text())
+                return sorted(data.get("flagged_episodes", []))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return []
+
+    def _save_flagged(episodes: list[int]):
+        _flagged_path().write_text(json.dumps({"flagged_episodes": sorted(episodes)}))
+
+    def _load_issue_episodes() -> set:
+        issues_path = static_folder / "annotation_issues.json"
+        if issues_path.is_file():
+            try:
+                issues = json.loads(issues_path.read_text())
+                return {issue["episode"] for issue in issues}
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+        return set()
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/flagged_episodes", methods=["GET"])
+    def get_flagged_episodes(dataset_namespace, dataset_name):
+        return jsonify({"flagged_episodes": _load_flagged()})
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/flagged_episodes", methods=["POST"])
+    def toggle_flagged_episode(dataset_namespace, dataset_name):
+        body = request.get_json(silent=True) or {}
+        episode_id = body.get("episode_id")
+        if episode_id is None:
+            return jsonify({"error": "episode_id required"}), 400
+        episode_id = int(episode_id)
+        current = set(_load_flagged())
+        if episode_id in current:
+            current.discard(episode_id)
+        else:
+            current.add(episode_id)
+        result = sorted(current)
+        _save_flagged(result)
+        return jsonify({"flagged_episodes": result})
+
+    # --- Subtask annotation helpers ---
+
+    def _subtask_ann_path() -> Path:
+        return static_folder / "subtask_annotations.json"
+
+    def _load_subtask_annotations() -> dict:
+        p = _subtask_ann_path()
+        if p.is_file():
+            try:
+                return json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
+    def _compute_subtask_states(timestamps: list, transitions: list) -> list:
+        sorted_tr = sorted(transitions, key=lambda x: x["time"])
+        result = []
+        for t in timestamps:
+            state = 0
+            for tr in sorted_tr:
+                if tr["time"] <= t:
+                    state = tr["state"]
+                else:
+                    break
+            result.append(state)
+        return result
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/subtask_annotations", methods=["GET"])
+    def get_subtask_annotations(dataset_namespace, dataset_name):
+        return jsonify({"annotations": _load_subtask_annotations()})
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/subtask_annotations", methods=["POST"])
+    def save_subtask_annotation(dataset_namespace, dataset_name):
+        body = request.get_json(silent=True) or {}
+        episode_id = body.get("episode_id")
+        if episode_id is None:
+            return jsonify({"error": "episode_id required"}), 400
+        episode_id = int(episode_id)
+        if not annotate and episode_id not in _load_issue_episodes():
+            return jsonify({"status": "readonly"}), 403
+        transitions = body.get("transitions", [])
+        update_csv = body.get("update_csv", False)
+
+        # Save to JSON
+        annotations = _load_subtask_annotations()
+        annotations[str(episode_id)] = transitions
+        _subtask_ann_path().write_text(json.dumps(annotations, indent=2))
+
+        # Optionally update precomputed CSV
+        if update_csv:
+            try:
+                ds = downsample if downsample and downsample > 1 else 1
+                csv_path = static_folder / "csv" / f"episode_{episode_id:06d}_ds{ds}.csv"
+                if csv_path.is_file():
+                    import csv as csv_mod
+                    with csv_path.open(newline="") as f:
+                        reader = csv_mod.DictReader(f)
+                        rows = list(reader)
+                        fieldnames = list(reader.fieldnames or [])
+                    if rows:
+                        timestamps = [float(r["timestamp"]) for r in rows]
+                        states = _compute_subtask_states(timestamps, transitions)
+                        col = "subtask_state"
+                        if col not in fieldnames:
+                            fieldnames.append(col)
+                        for row, st in zip(rows, states):
+                            row[col] = st
+                        with csv_path.open("w", newline="") as f:
+                            writer = csv_mod.DictWriter(f, fieldnames=fieldnames)
+                            writer.writeheader()
+                            writer.writerows(rows)
+            except Exception:
+                logging.exception("Failed to update CSV with subtask_state for episode %s", episode_id)
+
+        return jsonify({"status": "ok", "episode_id": episode_id})
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/subtask_merge_parquet", methods=["POST"])
+    def merge_subtask_parquet(dataset_namespace, dataset_name):
+        body = request.get_json(silent=True) or {}
+        episode_id = body.get("episode_id")
+        if episode_id is None:
+            return jsonify({"error": "episode_id required"}), 400
+        episode_id = int(episode_id)
+        if not annotate and episode_id not in _load_issue_episodes():
+            return jsonify({"status": "readonly"}), 403
+
+        annotations = _load_subtask_annotations()
+        transitions = annotations.get(str(episode_id))
+        if not transitions:
+            return jsonify({"status": "no_annotation"})
+
+        if dataset is None:
+            return jsonify({"status": "no_dataset"})
+
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq_mod
+
+            parquet_path = dataset.root / dataset.meta.get_data_file_path(episode_id)
+            if not parquet_path.is_file():
+                return jsonify({"status": "parquet_not_found"})
+
+            table = pq_mod.read_table(parquet_path)
+            timestamps = table["timestamp"].to_pylist()
+            states = _compute_subtask_states(timestamps, transitions)
+
+            col_name = "subtask_state"
+            if col_name in table.schema.names:
+                idx = table.schema.get_field_index(col_name)
+                table = table.remove_column(idx)
+            table = table.append_column(
+                pa.field(col_name, pa.int32()),
+                pa.array(states, type=pa.int32()),
+            )
+
+            tmp_path = parquet_path.with_suffix(".parquet.tmp")
+            pq_mod.write_table(table, tmp_path)
+            tmp_path.replace(parquet_path)
+            logging.info("Merged subtask_state into parquet for episode %s", episode_id)
+        except Exception:
+            logging.exception("Failed to merge subtask_state into parquet for episode %s", episode_id)
+            return jsonify({"status": "error"}), 500
+
+        return jsonify({"status": "ok", "episode_id": episode_id})
+
+    # Auto-flag issue episodes so they appear highlighted in the sidebar
+    _issue_eps = _load_issue_episodes()
+    if _issue_eps:
+        current_flagged = set(_load_flagged())
+        merged = current_flagged | _issue_eps
+        if merged != current_flagged:
+            _save_flagged(sorted(merged))
+            logging.info("Auto-flagged %d issue episodes", len(merged - current_flagged))
 
     if precompute_csv and dataset is not None and not precomputed_only:
         cache_dir = static_folder / "csv"
@@ -918,13 +1119,14 @@ def visualize_dataset_html(
     output_dir: Path | None = None,
     serve: bool = True,
     host: str = "127.0.0.1",
-    port: int = 9090,
+    port: int = 9091,
     force_override: bool = False,
     max_frames: int | None = None,
     prepare_videos: int | bool = False,
     downsample: int | None = None,
     precompute_csv: int | bool = False,
     precomputed_only: int | bool = False,
+    annotate: bool = False,
 ) -> Path | None:
     init_logging()
 
@@ -960,6 +1162,7 @@ def visualize_dataset_html(
                 port=port,
                 static_folder=static_dir,
                 template_folder=template_dir,
+                annotate=annotate,
             )
     else:
         # Create a simlink from the dataset video folder containing mp4 files to the output directory
@@ -985,6 +1188,7 @@ def visualize_dataset_html(
                 port=port,
                 static_folder=static_dir,
                 template_folder=template_dir,
+                annotate=annotate,
             )
 
 
@@ -1040,7 +1244,7 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=9090,
+        default=9091,
         help="Web port used by the http server.",
     )
     parser.add_argument(

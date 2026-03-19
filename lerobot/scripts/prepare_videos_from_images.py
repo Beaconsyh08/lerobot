@@ -17,6 +17,7 @@
 
 import argparse
 import csv
+import json
 import logging
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
@@ -186,6 +188,9 @@ def _get_columns_info(meta: LeRobotDatasetMetadata):
     selected_columns = [col for col, ft in meta.features.items() if ft["dtype"] in ["float32", "int32"]]
     if "timestamp" in selected_columns:
         selected_columns.remove("timestamp")
+    # subtask_state is computed fresh during precompute — never read from parquet
+    if "subtask_state" in selected_columns:
+        selected_columns.remove("subtask_state")
 
     ignored_columns = []
     filtered_columns = []
@@ -214,6 +219,212 @@ def _get_columns_info(meta: LeRobotDatasetMetadata):
     return columns, ignored_columns, selected_columns
 
 
+def _series_to_2d(series, dim: int) -> np.ndarray:
+    """Convert pandas Series of array-like values to (N, dim) float64 array."""
+    rows = []
+    for item in series:
+        if item is None:
+            rows.append([np.nan] * dim)
+            continue
+        vals = list(item)
+        if len(vals) >= dim:
+            rows.append(vals[:dim])
+        else:
+            rows.append(vals + [np.nan] * (dim - len(vals)))
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _compute_subtask_boundaries(
+    timestamps: np.ndarray,
+    action_data: np.ndarray,
+    state_data: np.ndarray | None,
+    fps: float,
+    episode_id: int = -1,
+    task: str = "",
+    gripper_margin: float = 0.6,
+) -> dict | None:
+    """Auto-detect subtask stage boundaries.
+
+    Priority: gripper detection (stage 2) is absolute — other stages adjust around it.
+    Each stage is guaranteed at least MIN_FRAMES (10) frames.
+
+    Stages (frame ranges, all half-open except stage 2 end inclusive):
+        0  [0, b1)        initial static — arm not moving
+        1  [b1, b2)       arm moving toward target
+        2  [b2, b3)       gripper transition  (last action_change − 0.6 s … state_change + 0.6 s)
+        3  [b3, b4)       arm moving after gripper event
+        4  [b4, N)        final static — arm not moving
+
+    Returns (boundaries_dict_or_None, issues_list).
+    """
+    issues = []
+    N = len(timestamps)
+    MIN_FRAMES = 10
+    if N < MIN_FRAMES * 5:
+        msg = f"too few frames ({N}) for 5 stages"
+        logging.warning("Episode %d: %s, skipping annotation.", episode_id, msg)
+        issues.append({"episode": episode_id, "type": "error", "reason": msg})
+        return None, issues
+
+    action_dim = action_data.shape[1]
+    state_dim = state_data.shape[1] if state_data is not None else 0
+    is_pick = "pick" in task.lower() if task else False
+
+    # ── 1. Gripper detection → stage 2 frame window (HIGHEST PRIORITY) ──
+    gripper_indices = [i for i in [7, 15] if i < action_dim]
+    # Collect ALL gripper transitions across all gripper columns
+    all_transitions = []  # list of (action_frame, state_frame, gripper_index)
+
+    for gi in gripper_indices:
+        ga = action_data[:, gi]
+        binary_action = (ga > 0.5).astype(int)
+        action_diffs = np.diff(binary_action)
+        action_transition_frames = np.where(action_diffs != 0)[0]
+
+        for af in action_transition_frames:
+            action_frame = af + 1
+            # corresponding state transition
+            state_frame = action_frame  # fallback
+            if state_data is not None and gi < state_dim:
+                gs = state_data[:, gi]
+                binary_state = (gs > 0.5).astype(int)
+                state_diffs = np.diff(binary_state)
+                state_transitions = np.where(state_diffs != 0)[0]
+                after = state_transitions[state_transitions >= af]
+                if len(after) > 0:
+                    state_frame = after[0] + 1
+            all_transitions.append((action_frame, state_frame, gi))
+
+    if not all_transitions:
+        msg = f"no gripper transition found (task: '{task}')" if is_pick else "no gripper transition found"
+        logging.warning("Episode %d: %s, skipping.", episode_id, msg)
+        issues.append({"episode": episode_id, "type": "error", "reason": msg})
+        return None, issues
+
+    if len(all_transitions) > 1:
+        frames_list = [int(t[0]) for t in all_transitions]
+        msg = f"{len(all_transitions)} gripper transitions at frames {frames_list}, using LAST"
+        logging.info("Episode %d: %s for stage 2.", episode_id, msg)
+        issues.append({"episode": episode_id, "type": "multi_gripper", "reason": msg, "frames": frames_list})
+
+    # Use the LAST transition for stage 2
+    last_action_frame, last_state_frame, _ = all_transitions[-1]
+
+    # Convert 0.6 s margin to frame indices via timestamp search (handles variable fps)
+    s2_start_time = float(timestamps[last_action_frame]) - gripper_margin
+    s2_end_time = float(timestamps[min(last_state_frame, N - 1)]) + gripper_margin
+    b2 = int(np.searchsorted(timestamps, s2_start_time, side="left"))
+    b3 = int(np.searchsorted(timestamps, s2_end_time, side="right"))
+    b2 = max(0, b2)
+    b3 = min(N, b3)
+    if b3 - b2 < MIN_FRAMES:
+        mid = (b2 + b3) // 2
+        b2 = max(0, mid - MIN_FRAMES // 2)
+        b3 = b2 + MIN_FRAMES
+        if b3 > N:
+            b3 = N
+            b2 = max(0, b3 - MIN_FRAMES)
+
+    # ── 2. Arm-motion detection → stages 0 & 4 ──
+    # Use only action columns (exclude grippers 7,15 and flag 16).
+    # Sliding window: 1s centered window, slides per-frame.
+    arm_idx = [i for i in range(action_dim) if i not in (7, 15, 16)]
+    if not arm_idx:
+        msg = "no arm action columns found"
+        logging.warning("Episode %d: %s, skipping annotation.", episode_id, msg)
+        issues.append({"episode": episode_id, "type": "error", "reason": msg})
+        return None, issues
+
+    arm_actions = action_data[:, arm_idx]
+    win = max(round(fps), 2)  # 1-second window in frames
+    CHANGE_THR = 0.1
+
+    # Per-column rolling range (max − min), sliding per-frame
+    max_range = np.zeros(N)
+    for j in range(arm_actions.shape[1]):
+        s = pd.Series(arm_actions[:, j])
+        roll_max = s.rolling(win, center=True, min_periods=1).max().values
+        roll_min = s.rolling(win, center=True, min_periods=1).min().values
+        max_range = np.maximum(max_range, roll_max - roll_min)
+
+    # b1 = first frame where 1s-range >= 0.1 AND state[1] or state[9] > -0.4
+    detected_b1 = b2  # fallback
+    for i in range(N):
+        if max_range[i] >= CHANGE_THR:
+            # Additional condition: state[1] or state[9] must be > -0.4
+            if state_data is not None:
+                s1 = state_data[i, 1] if state_dim > 1 else np.nan
+                s9 = state_data[i, 9] if state_dim > 9 else np.nan
+                if (not np.isnan(s1) and s1 > -0.4) or (not np.isnan(s9) and s9 > -0.4):
+                    detected_b1 = i
+                    break
+            else:
+                detected_b1 = i
+                break
+
+    # b4 = frame after last frame where 1s-range >= threshold (stage 3 → 4)
+    CHANGE_THR_END = 0.06
+    detected_b4 = b3  # fallback
+    for i in range(N - 1, -1, -1):
+        if max_range[i] >= CHANGE_THR_END:
+            detected_b4 = i + 1
+            break
+
+    # ── 3. Enforce MIN_FRAMES per stage ──
+    # Stage 2 (b2, b3) is fixed.  Adjust b1 and b4 around it.
+    b1 = detected_b1
+    b4 = detected_b4
+
+    # b1 ∈ [MIN_FRAMES, b2 − MIN_FRAMES]  (room for stages 0 and 1)
+    b1_lo = MIN_FRAMES
+    b1_hi = b2 - MIN_FRAMES
+    if b1_lo <= b1_hi:
+        b1 = max(b1_lo, min(b1_hi, b1))
+    else:
+        b1 = max(1, b2 // 2)
+
+    # Ensure stage 1 [b1, b2) is at least 2 seconds — push b1 earlier into stage 0
+    min_stage1_frames = max(round(fps * 2), MIN_FRAMES)
+    if b2 - b1 < min_stage1_frames:
+        b1 = max(MIN_FRAMES, b2 - min_stage1_frames)
+
+    # b4 ∈ [b3 + MIN_FRAMES, N − MIN_FRAMES]  (room for stages 3 and 4)
+    b4_lo = b3 + MIN_FRAMES
+    b4_hi = N - MIN_FRAMES
+    if b4_lo <= b4_hi:
+        b4 = max(b4_lo, min(b4_hi, b4))
+    else:
+        b4 = (b3 + N) // 2
+
+    # ── 4. Convert frame indices → timestamps ──
+    return {
+        "stage0_end": float(timestamps[min(b1, N - 1)]),
+        "stage2_start": float(timestamps[min(b2, N - 1)]),
+        "stage2_end": float(timestamps[min(b3 - 1, N - 1)]),
+        "stage4_start": float(timestamps[min(b4, N - 1)]),
+    }, issues
+
+
+def _assign_subtask_states(timestamps, boundaries) -> list[int]:
+    """Map each timestamp to a subtask state (0-4) based on boundaries."""
+    if boundaries is None:
+        return [0] * len(timestamps)
+    result = []
+    for t in timestamps:
+        tf = float(t)
+        if tf < boundaries["stage0_end"]:
+            result.append(0)
+        elif tf < boundaries["stage2_start"]:
+            result.append(1)
+        elif tf <= boundaries["stage2_end"]:
+            result.append(2)
+        elif tf < boundaries["stage4_start"]:
+            result.append(3)
+        else:
+            result.append(4)
+    return result
+
+
 def _write_episode_csv(
     dataset_root: Path,
     meta: LeRobotDatasetMetadata,
@@ -222,17 +433,40 @@ def _write_episode_csv(
     max_frames: int | None,
     downsample: int | None,
     overwrite: bool,
-) -> bool:
+) -> tuple[bool, dict | None, list]:
+    """Write precomputed CSV for one episode.
+
+    Returns (success, subtask_boundaries_or_None, issues_list).
+    """
     if out_path.exists() and not overwrite:
-        return True
+        return True, None, []
     parquet_path = dataset_root / meta.get_data_file_path(episode_id)
     if not parquet_path.is_file():
-        return False
+        return False, None, []
 
     columns, _, selected_columns = _get_columns_info(meta)
     data = pd.read_parquet(parquet_path, columns=selected_columns)
     if max_frames is not None:
         data = data.head(max_frames)
+
+    # Compute subtask boundaries from full-rate data (before downsample)
+    boundaries = None
+    ep_issues = []
+    action_dim = meta.shapes.get("action", [0])[0] if "action" in meta.features else 0
+    state_dim = meta.shapes.get("state", [0])[0] if "state" in meta.features else 0
+    if action_dim > 0 and "action" in data.columns and len(data) > 1:
+        fps = 1.0 / np.median(np.diff(data["timestamp"].values))
+        act_arr = _series_to_2d(data["action"], action_dim)
+        st_arr = _series_to_2d(data["state"], state_dim) if state_dim > 0 and "state" in data.columns else None
+        task = ""
+        if hasattr(meta, "episodes") and episode_id in meta.episodes:
+            tasks = meta.episodes[episode_id].get("tasks", [])
+            task = tasks[0] if tasks else ""
+        boundaries, ep_issues = _compute_subtask_boundaries(
+            data["timestamp"].values, act_arr, st_arr, fps,
+            episode_id=episode_id, task=task,
+        )
+
     if downsample is not None and downsample > 1:
         data = data.iloc[::downsample].reset_index(drop=True)
 
@@ -275,12 +509,19 @@ def _write_episode_csv(
 
     rows = np.hstack((np.expand_dims(data["timestamp"], axis=1), *data_arrays)).tolist()
 
+    # Add stage column from auto-annotation (as decimal: current_stage / 4)
+    if boundaries is not None:
+        states = _assign_subtask_states(data["timestamp"].values, boundaries)
+        header.append("stage")
+        for i, s in enumerate(states):
+            rows[i].append(s / 4.0)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
-    return True
+    return True, boundaries, ep_issues
 
 
 def _get_default_output_dir(root: Path) -> Path:
@@ -325,6 +566,7 @@ def _run_visualize_dataset_html(
     serve: bool,
     host: str,
     port: int,
+    annotate: bool = False,
 ) -> None:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.scripts.visualize_dataset_html import MetaOnlyDataset, visualize_dataset_html
@@ -346,6 +588,7 @@ def _run_visualize_dataset_html(
         downsample=downsample,
         precompute_csv=False,
         precomputed_only=precomputed_only,
+        annotate=annotate,
     )
 
 
@@ -414,7 +657,25 @@ def main():
         "--overwrite",
         type=int,
         default=0,
-        help="Overwrite existing precomputed files.",
+        help="Overwrite all existing precomputed files (videos + csv).",
+    )
+    parser.add_argument(
+        "--overwrite-csv",
+        type=int,
+        default=0,
+        help="Overwrite only existing precomputed CSV files (not videos).",
+    )
+    parser.add_argument(
+        "--annotate",
+        type=int,
+        default=0,
+        help="Enable interactive subtask annotation editing (press A to advance stage in frontend).",
+    )
+    parser.add_argument(
+        "--write-parquet",
+        type=int,
+        default=0,
+        help="Write computed subtask_state back into original parquet files (requires --annotate 1).",
     )
     parser.add_argument(
         "--run-visualize",
@@ -443,7 +704,7 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=9090,
+        default=9091,
         help="Web port used by visualize_dataset_html.",
     )
 
@@ -479,8 +740,12 @@ def main():
     if args.prepare_csv:
         csv_dir.mkdir(parents=True, exist_ok=True)
 
-    overwrite = bool(args.overwrite)
-    needs_prepare = overwrite or not _all_precomputed_files_exist(
+    overwrite_video = bool(args.overwrite)
+    overwrite_csv = bool(args.overwrite) or bool(args.overwrite_csv)
+    if args.write_parquet and not args.annotate:
+        logging.warning("--write-parquet requires --annotate 1. Enabling --annotate automatically.")
+        args.annotate = 1
+    needs_prepare = overwrite_video or overwrite_csv or not _all_precomputed_files_exist(
         static_dir=static_dir,
         episodes=episodes,
         image_keys=image_keys,
@@ -488,6 +753,9 @@ def main():
         prepare_csv=bool(args.prepare_csv),
         downsample=args.downsample,
     )
+
+    all_boundaries = {}
+    all_issues = []
 
     if needs_prepare:
         if args.prepare_videos or args.prepare_csv:
@@ -502,26 +770,134 @@ def main():
                                 image_key,
                                 static_dir,
                                 args.max_frames,
-                                overwrite,
+                                overwrite_video,
                             )
 
                     if args.prepare_csv:
                         ds = args.downsample if args.downsample and args.downsample > 1 else 1
                         csv_path = csv_dir / f"episode_{ep_id:06d}_ds{ds}.csv"
-                        _write_episode_csv(
+                        success, boundaries, ep_issues = _write_episode_csv(
                             args.root,
                             meta,
                             ep_id,
                             csv_path,
                             args.max_frames,
                             args.downsample,
-                            overwrite,
+                            overwrite_csv,
                         )
+                        if boundaries is not None:
+                            all_boundaries[str(ep_id)] = boundaries
+                        all_issues.extend(ep_issues)
                     pbar.update(1)
         else:
             logging.info("No precompute tasks selected. Skip prepare stage.")
     else:
         logging.info("Detected all precomputed files in '%s'. Skip prepare stage.", static_dir)
+
+    # Save annotation issues JSON for review
+    if all_issues:
+        issues_path = static_dir / "annotation_issues.json"
+        issues_path.write_text(json.dumps(all_issues, indent=2))
+        logging.info(
+            "Saved %d annotation issues to %s (errors: %d, multi_gripper: %d)",
+            len(all_issues), issues_path,
+            sum(1 for i in all_issues if i["type"] == "error"),
+            sum(1 for i in all_issues if i["type"] == "multi_gripper"),
+        )
+
+    # Write subtask_state column into original parquet files + update meta
+    if all_boundaries and args.write_parquet:
+        all_episode_stats = {}  # ep_id -> stats dict for subtask_state
+        with tqdm(total=len(all_boundaries), desc="Writing subtask_state to parquet", unit="episode", dynamic_ncols=True) as pbar:
+            for ep_str, bounds in all_boundaries.items():
+                ep_id = int(ep_str)
+                parquet_path = args.root / meta.get_data_file_path(ep_id)
+                if not parquet_path.is_file():
+                    pbar.update(1)
+                    continue
+                table = pq.read_table(parquet_path)
+                ts = table.column("timestamp").to_numpy()
+                states = _assign_subtask_states(ts, bounds)
+                # Verify no None values
+                none_indices = [i for i, s in enumerate(states) if s is None]
+                if none_indices:
+                    logging.warning(
+                        "Episode %d: subtask_state has %d None value(s) at indices: %s",
+                        ep_id, len(none_indices), none_indices,
+                    )
+                col = pa.array(states, type=pa.int32())
+                if "subtask_state" in table.column_names:
+                    idx = table.column_names.index("subtask_state")
+                    table = table.set_column(idx, "subtask_state", col)
+                else:
+                    table = table.append_column("subtask_state", col)
+                tmp_path = parquet_path.with_suffix(".tmp")
+                pq.write_table(table, tmp_path)
+                tmp_path.rename(parquet_path)
+                # Compute stats for this episode
+                arr = np.array(states, dtype=np.float64)
+                all_episode_stats[ep_id] = {
+                    "min": [int(arr.min())],
+                    "max": [int(arr.max())],
+                    "mean": [float(arr.mean())],
+                    "std": [float(arr.std())],
+                    "count": [len(arr)],
+                }
+                pbar.update(1)
+
+        # Update meta/info.json — add subtask_state to features
+        info_path = args.root / "meta" / "info.json"
+        if info_path.is_file():
+            info = json.loads(info_path.read_text())
+            if "subtask_state" not in info.get("features", {}):
+                info["features"]["subtask_state"] = {
+                    "dtype": "int32",
+                    "shape": [1],
+                    "names": None,
+                }
+                info_path.write_text(json.dumps(info, indent=2))
+                logging.info("Added subtask_state to %s", info_path)
+
+        # Update meta/episodes_stats.jsonl — add subtask_state stats per episode
+        stats_path = args.root / "meta" / "episodes_stats.jsonl"
+        if stats_path.is_file() and all_episode_stats:
+            import jsonlines
+
+            rows = []
+            with jsonlines.open(stats_path, mode="r") as reader:
+                for row in reader:
+                    ep_id = row["episode_index"]
+                    if ep_id in all_episode_stats:
+                        row["stats"]["subtask_state"] = all_episode_stats[ep_id]
+                    rows.append(row)
+            with jsonlines.open(stats_path, mode="w") as writer:
+                writer.write_all(rows)
+            logging.info("Updated subtask_state stats in %s", stats_path)
+
+    # Save auto-annotated subtask boundaries to JSON for the visualization frontend
+    if all_boundaries:
+        ann_path = static_dir / "subtask_annotations.json"
+        existing = {}
+        if ann_path.is_file():
+            try:
+                existing = json.loads(ann_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Convert boundaries to transitions format expected by frontend
+        for ep_str, bounds in all_boundaries.items():
+            if overwrite_csv or ep_str not in existing:
+                existing[ep_str] = [
+                    {"time": bounds["stage0_end"], "state": 1},
+                    {"time": bounds["stage2_start"], "state": 2},
+                    {"time": bounds["stage2_end"], "state": 3},
+                    {"time": bounds["stage4_start"], "state": 4},
+                ]
+        ann_path.write_text(json.dumps(existing, indent=2))
+        logging.info(
+            "Saved auto subtask annotations for %d episodes to %s",
+            len(all_boundaries),
+            ann_path,
+        )
 
     if args.run_visualize:
         logging.info("Launching visualize_dataset_html with output dir: %s", output_dir)
@@ -536,6 +912,7 @@ def main():
             serve=bool(args.serve),
             host=args.host,
             port=args.port,
+            annotate=bool(args.annotate),
         )
 
 

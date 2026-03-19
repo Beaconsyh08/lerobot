@@ -36,12 +36,23 @@
             </li>
         </ul>
 
-        <p>Episodes:</p>
+        <div class="flex items-center gap-2 mt-1">
+            <span>Episodes:</span>
+            <label class="text-xs flex items-center gap-1 cursor-pointer select-none">
+                <input type="checkbox" x-model="showFlaggedOnly" class="accent-red-500">
+                <span class="text-red-400">Flagged</span>
+            </label>
+            <input type="number" min="0" placeholder="#"
+                   class="w-14 px-1 py-0.5 text-xs bg-slate-800 border border-slate-600 rounded font-mono text-center"
+                   @keydown.enter="if($event.target.value!=='') window.location.href='episode_'+$event.target.value"
+                   title="Type episode number and press Enter to jump">
+        </div>
         <!-- episodes menu for medium & large screens -->
         <div class="ml-2 hidden md:block" x-data="episodePagination">
             <ul>
                 <template x-for="episode in paginatedEpisodes" :key="episode">
-                    <li class="font-mono text-sm mt-0.5">
+                    <li class="font-mono text-sm mt-0.5 flex items-center gap-1">
+                        <span x-show="flaggedEpisodes.has(episode)" class="inline-block w-1.5 h-1.5 rounded-full bg-red-500 shrink-0"></span>
                         <a :href="'episode_' + episode"
                            :class="{'underline': true, 'font-bold -ml-1': episode == {{ episode_id }}}"
                            x-text="'Episode ' + episode"></a>
@@ -74,11 +85,12 @@
                     :disabled="page === 1">&laquo;</button>
             <div class="flex">
                 <template x-for="(episode, index) in paginatedEpisodes" :key="episode">
-                    <p class="font-mono text-sm mt-0.5 px-2"
+                    <p class="font-mono text-sm mt-0.5 px-2 flex items-center gap-0.5"
                        :class="{
                            'font-bold': episode == {{ episode_id }},
                            'border-r': index !== paginatedEpisodes.length - 1
                        }">
+                        <span x-show="flaggedEpisodes.has(episode)" class="inline-block w-1.5 h-1.5 rounded-full bg-red-500 shrink-0"></span>
                         <a :href="'episode_' + episode" x-text="episode"></a>
                     </p>
                 </template>
@@ -100,11 +112,42 @@
     <!-- Content -->
     <div class="max-h-screen md:flex-1 min-h-0 flex flex-col gap-2 p-2 md:p-3 overflow-hidden">
         <div class="flex items-center justify-between gap-3 shrink-0">
-            <h1 class="text-lg md:text-xl font-bold font-mono">
-                Episode {{ episode_id }}
-            </h1>
+            <div class="flex items-center gap-2">
+                <h1 class="text-lg md:text-xl font-bold font-mono">
+                    Episode {{ episode_id }}
+                </h1>
+                <span x-text="isFlagged ? 'FLAGGED' : 'OK'"
+                      x-transition
+                      class="px-2 py-0.5 text-xs font-semibold rounded select-none cursor-pointer"
+                      :class="isFlagged ? 'bg-red-600/80 text-red-100' : 'bg-green-700/60 text-green-200'"
+                      @click="toggleFlag()"
+                      title="Click or press F to toggle"></span>
+                <span x-show="flaggedEpisodes.size > 0"
+                      x-text="'🚩' + flaggedEpisodes.size"
+                      class="px-1.5 py-0.5 text-xs font-mono rounded bg-red-900/50 text-red-300"
+                      title="Total flagged episodes"></span>
+                <span x-text="'S:' + subtaskState + '/4'"
+                      x-transition
+                      class="px-2 py-0.5 text-xs font-semibold rounded select-none"
+                      :class="[subtaskComplete
+                        ? 'bg-green-700/60 text-green-200'
+                        : subtaskState > 0
+                          ? 'bg-blue-700/60 text-blue-200'
+                          : 'bg-gray-700/50 text-gray-400',
+                        stageEditEnabled ? 'cursor-pointer' : 'cursor-default']"
+                      @click="stageEditEnabled && advanceSubtask()"
+                      :title="stageEditEnabled ? 'Click or press A to advance subtask state (resets at 4)' : 'Read-only (use --annotate 1 to enable editing)'"></span>
+                <div x-show="subtaskTransitions.length > 0" class="flex items-center gap-1.5" title="Current subtask stage | duration | % of total episode">
+                    <span x-text="'Stage: ' + currentSubtaskStage"
+                          class="px-2 py-0.5 text-xs font-semibold rounded bg-purple-800/60 text-purple-200"></span>
+                    <span x-text="currentStageDuration.toFixed(1) + 's'"
+                          class="px-2 py-0.5 text-xs font-semibold rounded bg-amber-800/60 text-amber-300"></span>
+                    <span x-text="currentStagePercent.toFixed(1) + '%'"
+                          class="px-2 py-0.5 text-xs font-semibold rounded bg-teal-800/60 text-teal-300"></span>
+                </div>
+            </div>
             <div class="text-xs hidden md:block text-gray-400">
-                Hotkeys: <span class="font-mono">Space</span> play/pause, <span class="font-mono">Arrow Left</span>/<span class="font-mono">Arrow Right</span> slower/faster, <span class="font-mono">Arrow Down</span>/<span class="font-mono">Arrow Up</span> next/prev episode
+                Hotkeys: <span class="font-mono">Space</span> play/pause, <span class="font-mono">Arrow Left</span>/<span class="font-mono">Arrow Right</span> slower/faster, <span class="font-mono">Arrow Down</span>/<span class="font-mono">Arrow Up</span> next/prev episode, <span class="font-mono">F</span> toggle flag, <span class="font-mono">A</span> subtask
             </div>
         </div>
 
@@ -275,7 +318,7 @@
                             }"></div>
                         </div>
                         <div class="min-h-0 rounded border border-slate-800 p-2 bg-slate-900/30 flex flex-col">
-                            <p class="text-xs font-medium text-gray-300 mb-1">Left Gripper / Right Gripper / Flag</p>
+                            <p class="text-xs font-medium text-gray-300 mb-1">Left Gripper / Right Gripper / Flag / Stage</p>
                             <div id="graph-gripper-flag" class="flex-1 min-h-0" @mouseleave="() => {
                                 if (dygraphGripperFlag) {
                                     dygraphGripperFlag.setSelection(dygraphIndex, undefined, true, true);
@@ -460,8 +503,32 @@
                 playbackRates: [0.25, 0.5, 1, 2, 3, 5],
                 playbackRate: 1,
                 columns: {{ columns | tojson }},
+                flaggedEpisodes: new Set(),
+                isFlagged: false,
+                showFlaggedOnly: localStorage.getItem('showFlaggedOnly') === '1',
+                flagUrl: "{{ flagged_url }}",
+                subtaskState: 0,
+                subtaskTransitions: [],
+                subtaskComplete: false,
+                currentSubtaskStage: 0,
+                currentStageDuration: 0,
+                currentStagePercent: 0,
+                subtaskUrl: "{{ subtask_url }}",
+                subtaskMergeUrl: "{{ subtask_merge_url }}",
+                annotateEnabled: {{ 'true' if annotate_enabled else 'false' }},
+                stageEditEnabled: {{ 'true' if stage_edit_enabled else 'false' }},
+                issueEpisodes: {{ issue_episodes | tojson }},
+                _dragState: null,
+                _rafId: null,
+                currentEpisodeId: {{ episode_id }},
                 // alpine initialization
                 init() {
+                    this.loadFlaggedEpisodes();
+                    this.$watch('showFlaggedOnly', (val) => {
+                        localStorage.setItem('showFlaggedOnly', val ? '1' : '0');
+                        window.__showFlaggedOnly = val;
+                    });
+                    window.__showFlaggedOnly = this.showFlaggedOnly;
                     const csvUrl = "{{ csv_url }}";
 
                     // process CSV data
@@ -499,8 +566,34 @@
                     this._onCloseZoom = () => {
                         this.closeZoomVideo();
                     };
+                    this._onToggleFlag = () => {
+                        this.toggleFlag();
+                    };
+                    this._onAdvanceSubtask = () => {
+                        this.advanceSubtask();
+                    };
                     window.addEventListener('visualizer-speed-step', this._onSpeedStep);
                     window.addEventListener('visualizer-close-zoom', this._onCloseZoom);
+                    window.addEventListener('visualizer-toggle-flag', this._onToggleFlag);
+                    window.addEventListener('visualizer-advance-subtask', this._onAdvanceSubtask);
+                    window.addEventListener('beforeunload', () => {
+                        if (this.stageEditEnabled && this.subtaskComplete) {
+                            const blob = new Blob(
+                                [JSON.stringify({episode_id: this.currentEpisodeId})],
+                                {type: 'application/json'}
+                            );
+                            navigator.sendBeacon(this.subtaskMergeUrl, blob);
+                        }
+                    });
+                    if (this.video) {
+                        this.video.addEventListener('timeupdate', () => {
+                            this._updateCurrentStage();
+                        });
+                        this.video.addEventListener('loadedmetadata', () => {
+                            this._updateCurrentStage();
+                        });
+                    }
+                    this.loadSubtaskAnnotation();
                     if (this.imageKeys.length > 0) {
                         const imageIndex = this.imageKeys.indexOf("image");
                         const wristIndex = this.imageKeys.indexOf("left_wrist_image");
@@ -560,6 +653,11 @@
                     stateLabels.forEach(assignToGroup);
                     actionLabels.forEach(assignToGroup);
 
+                    // Add 'stage' (auto-annotation subtask_state / 4) to gripper/flag group
+                    if (labels.includes("stage")) {
+                        gripperFlagSet.add("stage");
+                    }
+
                     const seriesOptions = {};
                     for (const label of actionLabels) {
                         seriesOptions[label] = { strokePattern: [6, 4] };
@@ -612,6 +710,7 @@
                     const buildColorsForLabels = (labelsInOrder) => {
                         let fallbackIndex = 0;
                         return labelsInOrder.map(label => {
+                            if (label === "stage") return "#ab47bc";
                             const idx = getIndexFromLabel(label);
                             const key = colorKeyFromIndex(idx);
                             if (key !== null && baseColors[key]) {
@@ -696,11 +795,43 @@
                         csvUrl,
                         { ...commonOptions, visibility: this.armJointMask },
                     );
+                    const stageUnderlayCallback = (ctx, area, g) => {
+                        if (!this.subtaskTransitions.length || !this.stageEditEnabled) return;
+                        ctx.save();
+                        for (let i = 0; i < this.subtaskTransitions.length; i++) {
+                            const tr = this.subtaskTransitions[i];
+                            const px = g.toDomXCoord(tr.time);
+                            if (px < area.x || px > area.x + area.w) continue;
+                            const isDragging = this._dragState && this._dragState.transitionIndex === i;
+                            // Vertical dashed line
+                            ctx.beginPath();
+                            ctx.setLineDash([4, 3]);
+                            ctx.strokeStyle = isDragging ? '#e040fb' : '#ab47bc';
+                            ctx.lineWidth = isDragging ? 3 : 1.5;
+                            ctx.moveTo(px, area.y);
+                            ctx.lineTo(px, area.y + area.h);
+                            ctx.stroke();
+                            // Handle circle at top
+                            ctx.setLineDash([]);
+                            ctx.fillStyle = isDragging ? '#e040fb' : '#ab47bc';
+                            ctx.beginPath();
+                            ctx.arc(px, area.y + 10, 7, 0, 2 * Math.PI);
+                            ctx.fill();
+                            // State number label
+                            ctx.fillStyle = '#ffffff';
+                            ctx.font = 'bold 10px monospace';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText(String(tr.state), px, area.y + 10);
+                        }
+                        ctx.restore();
+                    };
                     this.dygraphGripperFlag = new Dygraph(
                         document.getElementById("graph-gripper-flag"),
                         csvUrl,
-                        { ...commonOptions, visibility: this.gripperFlagMask },
+                        { ...commonOptions, visibility: this.gripperFlagMask, underlayCallback: stageUnderlayCallback },
                     );
+                    this.initStageDrag();
                 },
 
                 //#region Table Data
@@ -1120,6 +1251,274 @@
                     };
                     update(this.dygraphArmJoints);
                     update(this.dygraphGripperFlag);
+                },
+
+                _syncFlaggedToWindow() {
+                    window.__flaggedEpisodesList = Array.from(this.flaggedEpisodes).sort((a, b) => a - b);
+                },
+
+                async loadFlaggedEpisodes() {
+                    try {
+                        const resp = await fetch(this.flagUrl);
+                        const data = await resp.json();
+                        this.flaggedEpisodes = new Set(data.flagged_episodes || []);
+                        this.isFlagged = this.flaggedEpisodes.has(this.currentEpisodeId);
+                        this._syncFlaggedToWindow();
+                        window.dispatchEvent(new CustomEvent('flagged-updated'));
+                    } catch (e) {
+                        console.warn('Failed to load flagged episodes:', e);
+                    }
+                },
+
+                async toggleFlag() {
+                    try {
+                        const resp = await fetch(this.flagUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ episode_id: this.currentEpisodeId }),
+                        });
+                        const data = await resp.json();
+                        this.flaggedEpisodes = new Set(data.flagged_episodes || []);
+                        this.isFlagged = this.flaggedEpisodes.has(this.currentEpisodeId);
+                        this._syncFlaggedToWindow();
+                        window.dispatchEvent(new CustomEvent('flagged-updated'));
+                    } catch (e) {
+                        console.warn('Failed to toggle flag:', e);
+                    }
+                },
+
+                _updateCurrentStage() {
+                    if (!this.subtaskTransitions.length) {
+                        this.currentSubtaskStage = 0;
+                        this.currentStageDuration = 0;
+                        this.currentStagePercent = 0;
+                        return;
+                    }
+                    const t = this.video ? this.video.currentTime : 0;
+                    const totalDuration = (this.video && isFinite(this.video.duration)) ? this.video.duration : 0;
+                    const sortedTr = [...this.subtaskTransitions].sort((a, b) => a.time - b.time);
+
+                    // Determine current stage
+                    let stage = 0;
+                    for (const tr of sortedTr) {
+                        if (tr.time <= t) stage = tr.state;
+                        else break;
+                    }
+                    this.currentSubtaskStage = stage;
+
+                    // Compute stage time range
+                    if (totalDuration > 0) {
+                        const startTr = sortedTr.find(tr => tr.state === stage);
+                        const endTr = sortedTr.find(tr => tr.state === stage + 1);
+                        const stageStart = stage === 0 ? 0 : (startTr ? startTr.time : 0);
+                        const stageEnd = endTr ? endTr.time : totalDuration;
+                        this.currentStageDuration = Math.max(0, stageEnd - stageStart);
+                        this.currentStagePercent = (this.currentStageDuration / totalDuration) * 100;
+                    } else {
+                        this.currentStageDuration = 0;
+                        this.currentStagePercent = 0;
+                    }
+                },
+
+                async loadSubtaskAnnotation() {
+                    try {
+                        const resp = await fetch(this.subtaskUrl);
+                        const data = await resp.json();
+                        const ann = (data.annotations || {})[String(this.currentEpisodeId)];
+                        if (ann && ann.length > 0) {
+                            this.subtaskTransitions = ann;
+                            this.subtaskState = ann[ann.length - 1].state;
+                            this.subtaskComplete = this.subtaskState === 4;
+                        }
+                        this._updateCurrentStage();
+                        // Redraw chart to show transition handles
+                        if (this.stageEditEnabled && this.subtaskTransitions.length > 0) {
+                            setTimeout(() => {
+                                const g = this.dygraphGripperFlag;
+                                if (g && g.rawData_) {
+                                    if (typeof g.predraw_ === 'function') {
+                                        g.predraw_();
+                                    }
+                                }
+                            }, 300);
+                        }
+                    } catch (e) {
+                        console.warn('Failed to load subtask annotation:', e);
+                    }
+                },
+
+                advanceSubtask() {
+                    if (!this.stageEditEnabled) return;
+                    if (this.subtaskState === 4) {
+                        // Reset for re-annotation
+                        this.subtaskState = 0;
+                        this.subtaskTransitions = [];
+                        this.subtaskComplete = false;
+                        this.currentSubtaskStage = 0;
+                        return;
+                    }
+                    this.subtaskState += 1;
+                    const currentTime = this.video ? this.video.currentTime : 0;
+                    this.subtaskTransitions.push({time: currentTime, state: this.subtaskState});
+                    this._updateCurrentStage();
+                    if (this.subtaskState === 4) {
+                        this.subtaskComplete = true;
+                        this.saveSubtaskAnnotation(true);
+                    }
+                },
+
+                async saveSubtaskAnnotation(updateCsv) {
+                    try {
+                        await fetch(this.subtaskUrl, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                episode_id: this.currentEpisodeId,
+                                transitions: this.subtaskTransitions,
+                                update_csv: updateCsv,
+                            }),
+                        });
+                    } catch (e) {
+                        console.warn('Failed to save subtask annotation:', e);
+                    }
+                },
+
+                // ── Stage drag-to-edit on gripper/flag chart ──
+
+                initStageDrag() {
+                    const chartEl = document.getElementById('graph-gripper-flag');
+                    if (!chartEl) return;
+
+                    // Cursor feedback on hover
+                    chartEl.addEventListener('mousemove', (e) => {
+                        if (!this.stageEditEnabled || !this.dygraphGripperFlag || this._dragState) return;
+                        const idx = this._findNearestTransition(e);
+                        chartEl.style.cursor = idx >= 0 ? 'ew-resize' : '';
+                    });
+
+                    // Start drag (capture phase to intercept before dygraphs)
+                    chartEl.addEventListener('mousedown', (e) => {
+                        if (!this.stageEditEnabled || !this.dygraphGripperFlag) return;
+                        if (e.button !== 0) return;
+                        const idx = this._findNearestTransition(e);
+                        if (idx < 0) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this._dragState = { transitionIndex: idx };
+                        document.body.style.cursor = 'ew-resize';
+                    }, true);
+
+                    // Drag move
+                    document.addEventListener('mousemove', (e) => {
+                        if (!this._dragState) return;
+                        e.preventDefault();
+                        const graph = this.dygraphGripperFlag;
+                        const rect = document.getElementById('graph-gripper-flag').getBoundingClientRect();
+                        const canvasX = e.clientX - rect.left;
+                        const dataCoords = graph.toDataCoords(canvasX, 0);
+                        let newTime = dataCoords[0];
+                        newTime = this._clampTransitionTime(this._dragState.transitionIndex, newTime);
+                        this.subtaskTransitions[this._dragState.transitionIndex].time = newTime;
+                        // Sync video and chart cursor to drag position
+                        this.dygraphTime = newTime;
+                        this.videos.forEach(video => (video.currentTime = newTime));
+                        if (!this._rafId) {
+                            this._rafId = requestAnimationFrame(() => {
+                                this._updateStageInChart();
+                                this._rafId = null;
+                            });
+                        }
+                    });
+
+                    // End drag
+                    document.addEventListener('mouseup', (e) => {
+                        if (!this._dragState) return;
+                        this._dragState = null;
+                        document.body.style.cursor = '';
+                        this._updateStageInChart();
+                        this._updateCurrentStage();
+                        // Mark complete and save
+                        if (this.subtaskTransitions.length > 0) {
+                            this.subtaskState = Math.max(...this.subtaskTransitions.map(t => t.state));
+                            this.subtaskComplete = this.subtaskState === 4;
+                        }
+                        this.saveSubtaskAnnotation(true);
+                    });
+                },
+
+                _findNearestTransition(e) {
+                    const graph = this.dygraphGripperFlag;
+                    if (!graph || !this.subtaskTransitions.length) return -1;
+                    const rect = document.getElementById('graph-gripper-flag').getBoundingClientRect();
+                    const canvasX = e.clientX - rect.left;
+                    const area = graph.getArea();
+                    if (canvasX < area.x - 12 || canvasX > area.x + area.w + 12) return -1;
+                    const thresholdPx = 12;
+                    let nearest = -1;
+                    let minDist = Infinity;
+                    for (let i = 0; i < this.subtaskTransitions.length; i++) {
+                        const px = graph.toDomXCoord(this.subtaskTransitions[i].time);
+                        const dist = Math.abs(canvasX - px);
+                        if (dist < thresholdPx && dist < minDist) {
+                            minDist = dist;
+                            nearest = i;
+                        }
+                    }
+                    return nearest;
+                },
+
+                _clampTransitionTime(idx, newTime) {
+                    const sorted = [...this.subtaskTransitions].sort((a, b) => a.state - b.state);
+                    const trState = this.subtaskTransitions[idx].state;
+                    const trSortIdx = sorted.findIndex(s => s.state === trState);
+                    const minTime = trSortIdx > 0 ? sorted[trSortIdx - 1].time + 0.05 : 0;
+                    const maxDuration = this.video ? this.video.duration : 999;
+                    const maxTime = trSortIdx < sorted.length - 1 ? sorted[trSortIdx + 1].time - 0.05 : maxDuration;
+                    return Math.max(minTime, Math.min(maxTime, newTime));
+                },
+
+                _updateStageInChart() {
+                    const gripperGraph = this.dygraphGripperFlag;
+                    if (!gripperGraph || !gripperGraph.rawData_) return;
+                    const labels = gripperGraph.getLabels();
+                    const stageIdx = labels.indexOf('stage');
+                    if (stageIdx < 0) return;
+
+                    const sortedTr = [...this.subtaskTransitions].sort((a, b) => a.time - b.time);
+                    const data = gripperGraph.rawData_;
+
+                    for (let i = 0; i < data.length; i++) {
+                        const t = data[i][0];
+                        let state = 0;
+                        for (const tr of sortedTr) {
+                            if (tr.time <= t) state = tr.state;
+                            else break;
+                        }
+                        data[i][stageIdx] = state / 4;
+                    }
+
+                    // Also update arm chart in place
+                    const armGraph = this.dygraphArmJoints;
+                    if (armGraph && armGraph.rawData_) {
+                        for (let i = 0; i < armGraph.rawData_.length; i++) {
+                            armGraph.rawData_[i][stageIdx] = data[i] ? data[i][stageIdx] : 0;
+                        }
+                    }
+
+                    // Update baseGraphData
+                    if (this.baseGraphData) {
+                        for (let i = 0; i < this.baseGraphData.length && i < data.length; i++) {
+                            this.baseGraphData[i][stageIdx] = data[i][stageIdx];
+                        }
+                    }
+
+                    // Redraw
+                    if (typeof gripperGraph.predraw_ === 'function') {
+                        gripperGraph.predraw_();
+                        if (armGraph && typeof armGraph.predraw_ === 'function') {
+                            armGraph.predraw_();
+                        }
+                    }
                 }
             };
         }
@@ -1132,22 +1531,31 @@
                 page: 1,
 
                 init() {
-                    // Find which page contains the current episode_id
                     const currentEpisodeId = {{ episode_id }};
-                    const episodeIndex = this.episodes.indexOf(currentEpisodeId);
-                    if (episodeIndex !== -1) {
-                        this.page = Math.floor(episodeIndex / this.pageSize) + 1;
+                    const relocatePage = () => {
+                        const idx = this.displayEpisodes.indexOf(currentEpisodeId);
+                        this.page = idx !== -1 ? Math.floor(idx / this.pageSize) + 1 : 1;
+                    };
+                    relocatePage();
+                    this.$watch('showFlaggedOnly', relocatePage);
+                    window.addEventListener('flagged-updated', relocatePage);
+                },
+
+                get displayEpisodes() {
+                    if (this.showFlaggedOnly && this.flaggedEpisodes && this.flaggedEpisodes.size > 0) {
+                        return this.episodes.filter(ep => this.flaggedEpisodes.has(ep));
                     }
+                    return this.episodes;
                 },
 
                 get totalPages() {
-                    return Math.ceil(this.episodes.length / this.pageSize);
+                    return Math.ceil(this.displayEpisodes.length / this.pageSize);
                 },
 
                 get paginatedEpisodes() {
                     const start = (this.page - 1) * this.pageSize;
                     const end = start + this.pageSize;
-                    return this.episodes.slice(start, end);
+                    return this.displayEpisodes.slice(start, end);
                 },
 
                 nextPage() {
@@ -1166,6 +1574,7 @@
     </script>
 
     <script>
+        window.__stageEditEnabled = {{ 'true' if stage_edit_enabled else 'false' }};
         window.addEventListener('keydown', (e) => {
             // Use the space bar to play and pause, instead of default action (e.g. scrolling)
             const { keyCode, key } = e;
@@ -1190,13 +1599,21 @@
                 window.dispatchEvent(new CustomEvent('visualizer-speed-step', {
                     detail: { step: key === 'ArrowRight' ? 1 : -1 },
                 }));
+            } else if (key === 'f' || key === 'F') {
+                e.preventDefault();
+                window.dispatchEvent(new CustomEvent('visualizer-toggle-flag'));
+            } else if ((key === 'a' || key === 'A') && window.__stageEditEnabled) {
+                e.preventDefault();
+                window.dispatchEvent(new CustomEvent('visualizer-advance-subtask'));
             } else if (key === 'ArrowDown' || key === 'ArrowUp') {
-                const episodes = {{ episodes }};  // Access episodes directly from the Jinja template
-                const nextEpisodeId = key === 'ArrowDown' ? {{ episode_id }} + 1 : {{ episode_id }} - 1;
-                const lowestEpisodeId = episodes.at(0);
-                const highestEpisodeId = episodes.at(-1);
-                if (nextEpisodeId >= lowestEpisodeId && nextEpisodeId <= highestEpisodeId) {
-                    window.location.href = `./episode_${nextEpisodeId}`;
+                const allEpisodes = {{ episodes }};
+                const flaggedOnly = window.__showFlaggedOnly || false;
+                const episodes = flaggedOnly && window.__flaggedEpisodesList && window.__flaggedEpisodesList.length > 0
+                    ? window.__flaggedEpisodesList : allEpisodes;
+                const currentIdx = episodes.indexOf({{ episode_id }});
+                const nextIdx = key === 'ArrowDown' ? currentIdx + 1 : currentIdx - 1;
+                if (nextIdx >= 0 && nextIdx < episodes.length) {
+                    window.location.href = `./episode_${episodes[nextIdx]}`;
                 }
             }
         });
