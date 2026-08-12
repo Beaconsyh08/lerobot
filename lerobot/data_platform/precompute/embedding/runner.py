@@ -8,10 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
 from lerobot.data_platform.precompute.embedding.policy_backend import PolicyEmbedder, get_capabilities
-from lerobot.data_platform.precompute.embedding.reducer import fit_reducer, load_reducer, reducer_name, save_reducer, transform
+from lerobot.data_platform.precompute.embedding.reducer import (
+    fit_reducer,
+    load_reducer,
+    reducer_name,
+    save_reducer,
+    transform,
+)
 
 
 @dataclass
@@ -128,7 +134,14 @@ def _source_matches(source: dict, embedder: PolicyEmbedder, layer_hook: str) -> 
 def _summarize_timing_rows(rows: list[dict]) -> dict:
     if not rows:
         return {"count": 0}
-    keys = sorted({key for row in rows for key, value in row.items() if isinstance(value, (int, float, np.integer, np.floating))})
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key, value in row.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+    )
     summary = {"count": len(rows)}
     for key in keys:
         values = np.asarray([float(row[key]) for row in rows if key in row], dtype=np.float64)
@@ -162,7 +175,9 @@ def run_embedding(
     embedding_dir = static_dir / "embedding"
     embedding_dir.mkdir(parents=True, exist_ok=True)
     selected_episodes = sorted(getattr(meta, "episodes", {}).keys()) if episodes is None else list(episodes)
-    embedder = PolicyEmbedder(ckpt_path, layer_hook, openpi_config=openpi_config, workers=workers, devices=devices)
+    embedder = PolicyEmbedder(
+        ckpt_path, layer_hook, openpi_config=openpi_config, workers=workers, devices=devices
+    )
 
     source = _load_source(embedding_dir)
     source_compatible = _source_matches(source, embedder, layer_hook)
@@ -172,13 +187,15 @@ def run_embedding(
         old_episode_indices, old_vectors = existing
         vectors_by_episode.update({int(ep): old_vectors[i] for i, ep in enumerate(old_episode_indices)})
 
-    to_compute = [episode_index for episode_index in selected_episodes if int(episode_index) not in vectors_by_episode]
+    to_compute = [
+        episode_index for episode_index in selected_episodes if int(episode_index) not in vectors_by_episode
+    ]
     episode_timings: list[dict] = []
 
     def _compute_episode(episode_index: int) -> tuple[int, np.ndarray, dict]:
         start = time.perf_counter()
         read_start = time.perf_counter()
-        table = pq.read_table(root / meta.get_data_file_path(episode_index))
+        table = read_episode_table(root, meta, episode_index)
         read_s = time.perf_counter() - read_start
         embed_start = time.perf_counter()
         vector = embedder.embed_episode(
@@ -208,7 +225,10 @@ def run_embedding(
     try:
         if to_compute and embedder.parallelism > 1:
             with ThreadPoolExecutor(max_workers=embedder.parallelism) as executor:
-                futures = {executor.submit(_compute_episode, int(episode_index)): int(episode_index) for episode_index in to_compute}
+                futures = {
+                    executor.submit(_compute_episode, int(episode_index)): int(episode_index)
+                    for episode_index in to_compute
+                }
                 for future in as_completed(futures):
                     episode_index, vector, timing = future.result()
                     vectors_by_episode[episode_index] = vector
@@ -256,7 +276,9 @@ def run_embedding(
     }
 
     all_episodes = sorted(vectors_by_episode)
-    embeddings = np.stack([vectors_by_episode[episode_index] for episode_index in all_episodes]).astype(np.float32)
+    embeddings = np.stack([vectors_by_episode[episode_index] for episode_index in all_episodes]).astype(
+        np.float32
+    )
     reducer_path = embedding_dir / "reducer.pkl"
     if reducer_path.is_file() and not refit and source_compatible:
         reducer = load_reducer(reducer_path)
@@ -274,8 +296,14 @@ def run_embedding(
         "points": int(len(all_episodes)),
     }
 
-    np.savez_compressed(embedding_dir / "embeddings.npz", episode_index=np.asarray(all_episodes, dtype=np.int64), embeddings=embeddings)
-    np.savez_compressed(embedding_dir / "coords_2d.npz", episode_index=np.asarray(all_episodes, dtype=np.int64), coords=coords)
+    np.savez_compressed(
+        embedding_dir / "embeddings.npz",
+        episode_index=np.asarray(all_episodes, dtype=np.int64),
+        embeddings=embeddings,
+    )
+    np.savez_compressed(
+        embedding_dir / "coords_2d.npz", episode_index=np.asarray(all_episodes, dtype=np.int64), coords=coords
+    )
     (embedding_dir / "embedding_profile.json").write_text(json.dumps(profile, indent=2))
     (embedding_dir / "source.json").write_text(
         json.dumps(
@@ -297,7 +325,14 @@ def run_embedding(
             indent=2,
         )
     )
-    _emit(progress_callback, status="done", step="embedding_done", current=len(all_episodes), total=len(all_episodes), message="Embedding complete")
+    _emit(
+        progress_callback,
+        status="done",
+        step="embedding_done",
+        current=len(all_episodes),
+        total=len(all_episodes),
+        message="Embedding complete",
+    )
     return EmbeddingResult(
         root=root,
         repo_id=getattr(meta, "repo_id", f"local/{root.name}"),

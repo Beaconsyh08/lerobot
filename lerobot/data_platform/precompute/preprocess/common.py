@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-
 ProgressCallback = Callable[[dict], None] | None
 
 
@@ -77,7 +76,9 @@ def copy_meta_files(src_root: Path, out_root: Path) -> None:
     out_meta = Path(out_root) / "meta"
     out_meta.mkdir(parents=True, exist_ok=True)
     for path in src_meta.iterdir():
-        if path.is_file():
+        if path.is_dir():
+            shutil.copytree(path, out_meta / path.name)
+        else:
             shutil.copy2(path, out_meta / path.name)
 
 
@@ -109,7 +110,10 @@ def format_data_path(info: dict, episode_index: int) -> Path:
 
 def format_video_path(info: dict, episode_index: int, video_key: str) -> Path:
     chunks_size = int(info.get("chunks_size") or 1000)
-    template = info.get("video_path") or "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    template = (
+        info.get("video_path")
+        or "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    )
     return Path(
         template.format(
             episode_chunk=episode_index // chunks_size,
@@ -123,7 +127,9 @@ def video_feature_keys(info: dict) -> list[str]:
     return [key for key, feature in (info.get("features") or {}).items() if feature.get("dtype") == "video"]
 
 
-def update_info_counts(info: dict, total_episodes: int, total_frames: int, total_tasks: int | None = None) -> dict:
+def update_info_counts(
+    info: dict, total_episodes: int, total_frames: int, total_tasks: int | None = None
+) -> dict:
     updated = dict(info)
     chunks_size = int(updated.get("chunks_size") or 1000)
     updated["total_episodes"] = int(total_episodes)

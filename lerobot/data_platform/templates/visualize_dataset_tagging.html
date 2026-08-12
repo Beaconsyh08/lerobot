@@ -433,7 +433,7 @@ async function resetCurrent() {
   await load();
 }
 async function mergeTags() {
-  if (!confirm("Merge current tags into meta/episodes.jsonl?")) return;
+  if (!confirm("Merge current tags into episode metadata (v2.1 JSONL or v3 Parquet)?")) return;
   await fetchJson(`${API}/merge${variantQuery()}`, {method:"POST"});
   alert("merged");
 }

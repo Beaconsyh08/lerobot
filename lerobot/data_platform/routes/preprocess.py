@@ -1,44 +1,64 @@
+import json
 import logging
 import threading
 import time
 import uuid
-import json
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 from flask import jsonify, render_template, request
 
+from lerobot.data_platform.cli import get_default_output_dir, run_precompute
+from lerobot.data_platform.precompute.dataset_io import (
+    V3DatasetMetadata,
+    is_v3_dataset,
+    load_episode_records,
+    read_episode_table,
+)
 from lerobot.data_platform.precompute.preprocess import (
+    DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_PROMPT_PATTERN,
     DEFAULT_PROMPT_REPLACEMENT,
+    DEFAULT_V3_CONVERT_WORKERS,
+    DEFAULT_VIDEO_FILE_SIZE_IN_MB,
     FLAG_FIX_DELETE_ALL_FLAGGED,
     FLAG_FIX_STATE_GRIPPER_TRANSITION_ACTION,
     FLAG_FIX_STUCK_CLOSED_ACTION,
     FLAG_FIX_TRIM_EARLY_GRIPPER,
+    IMAGE_VIDEO_MODE_LEROBOT_OFFICIAL,
     clear_all_flags,
     default_standardize_path,
+    default_v3_path,
     delete_episodes_inplace,
-    get_capabilities as get_preprocess_capabilities,
     load_flagged_episode_ids,
+    normalize_image_video_mode,
+    repair_v3_video_timestamps,
     run_convert_action,
+    run_convert_v3,
     run_drop_field,
-    run_flag_fix,
     run_fix_prompt_prepositions,
+    run_flag_fix,
     run_lowercase_prompts,
+    run_merge,
     run_quality_flag_detection,
     run_rewrite_prompts,
-    run_merge,
     run_smooth_action,
-    run_standardize_dataset,
     run_split,
+    run_standardize_dataset,
     run_subtract,
 )
-from lerobot.data_platform.precompute.preprocess.common import format_data_path, load_json, load_jsonl
+from lerobot.data_platform.precompute.preprocess import (
+    get_capabilities as get_preprocess_capabilities,
+)
+from lerobot.data_platform.precompute.preprocess.common import format_data_path, load_json
 from lerobot.data_platform.precompute.preprocess.quality_flags import apply_task_assignment_choice
 from lerobot.data_platform.precompute.preprocess.smooth_action import SMOOTH_ACTION_META
-from lerobot.data_platform.precompute.timeseries import DATA_VERSION_DVT1, DATA_VERSION_DVT2, infer_data_version_from_features
-from lerobot.data_platform.cli import get_default_output_dir, run_precompute
+from lerobot.data_platform.precompute.timeseries import (
+    DATA_VERSION_DVT1,
+    DATA_VERSION_DVT2,
+    infer_data_version_from_features,
+)
 from lerobot.data_platform.routes.context import RouteContext
 
 
@@ -228,13 +248,22 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
     def _series_array(root: Path, episode_index: int, field: str) -> np.ndarray:
         root = Path(root).expanduser()
         info = load_json(root / "meta" / "info.json")
-        path = root / format_data_path(info, episode_index)
+        meta = V3DatasetMetadata(f"local/{root.name}", root) if is_v3_dataset(root) else None
+        path = (
+            root / meta.get_data_file_path(episode_index)
+            if meta is not None
+            else root / format_data_path(info, episode_index)
+        )
         if not path.is_file():
             raise FileNotFoundError(f"Missing episode parquet: {path}")
         schema = pq.read_schema(path)
         if field not in schema.names:
             raise ValueError(f"Missing {field} column in {path}")
-        table = pq.read_table(path, columns=[field])
+        table = (
+            read_episode_table(root, meta, episode_index, columns=[field])
+            if meta is not None
+            else pq.read_table(path, columns=[field])
+        )
         arr = np.asarray(table[field].to_pylist(), dtype=np.float32)
         if arr.ndim < 2:
             arr = arr.reshape((-1, 1))
@@ -248,7 +277,7 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             meta = _smooth_meta(Path(dataset_obj.root))
         except Exception as exc:
             return str(exc), 404
-        episodes = load_jsonl(Path(dataset_obj.root) / "meta" / "episodes.jsonl")
+        episodes = load_episode_records(Path(dataset_obj.root))
         first_episode = int(episodes[0]["episode_index"]) if episodes else 0
         return render_template(
             "visualize_dataset_smoothing.html",
@@ -267,13 +296,17 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             meta = _smooth_meta(Path(dataset_obj.root))
         except Exception as exc:
             return jsonify({"error": str(exc)}), 404
-        episodes = load_jsonl(Path(dataset_obj.root) / "meta" / "episodes.jsonl")
+        episodes = load_episode_records(Path(dataset_obj.root))
         return jsonify(
             {
                 "meta": meta,
                 "fields": meta.get("fields") or [meta.get("field") or "action"],
                 "episodes": [
-                    {"episode_index": int(row["episode_index"]), "length": int(row.get("length") or 0), "tasks": row.get("tasks", [])}
+                    {
+                        "episode_index": int(row["episode_index"]),
+                        "length": int(row.get("length") or 0),
+                        "tasks": row.get("tasks", []),
+                    }
                     for row in episodes
                 ],
             }
@@ -334,11 +367,18 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         target_dim = int(options.get("target_dim") or 16)
         dry_run = ctx.bool_option(options, "dry_run", False)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_convert_action", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or ""))
+        job = _new_job(
+            "preprocess_convert_action",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(_out_root(options) or ""),
+        )
 
         def _run_job() -> None:
             try:
-                ctx.update_job(job, {"status": "running", "message": "Starting action/state dimension conversion"})
+                ctx.update_job(
+                    job, {"status": "running", "message": "Starting action/state dimension conversion"}
+                )
                 result = run_convert_action(
                     dataset_obj.root,
                     out_root=_out_root(options),
@@ -352,6 +392,183 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 ctx.fail_job(job, "Preprocess convert_action failed", exc)
 
         threading.Thread(target=_run_job, name=f"preprocess-convert-{job['id']}", daemon=True).start()
+        return jsonify({"job": ctx.serialize_job(job)})
+
+    @app.route("/api/preprocess/convert_v3/start", methods=["POST"])
+    def api_preprocess_convert_v3_start():
+        body = request.get_json(silent=True) or {}
+        options = body.get("options") or body
+        try:
+            dataset_key = ctx.dataset_key_from_body(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        index_entry = ctx.datasets_index.get(dataset_key)
+        if index_entry is None:
+            return jsonify({"error": "dataset is not registered"}), 404
+
+        src_root = Path(index_entry["root"]).expanduser()
+        info = load_json(src_root / "meta" / "info.json")
+        raw_version = str(info.get("codebase_version") or "").lower().removeprefix("v")
+        source_is_v3 = raw_version == "3" or raw_version.startswith("3.")
+        data_file_size_in_mb = DEFAULT_DATA_FILE_SIZE_IN_MB
+        video_file_size_in_mb = DEFAULT_VIDEO_FILE_SIZE_IN_MB
+        workers = DEFAULT_V3_CONVERT_WORKERS
+        image_video_mode = IMAGE_VIDEO_MODE_LEROBOT_OFFICIAL
+        if not source_is_v3:
+            try:
+                data_file_size_value = options.get("data_file_size_in_mb")
+                video_file_size_value = options.get("video_file_size_in_mb")
+                data_file_size_in_mb = int(
+                    DEFAULT_DATA_FILE_SIZE_IN_MB
+                    if data_file_size_value in (None, "")
+                    else data_file_size_value
+                )
+                video_file_size_in_mb = int(
+                    DEFAULT_VIDEO_FILE_SIZE_IN_MB
+                    if video_file_size_value in (None, "")
+                    else video_file_size_value
+                )
+            except (TypeError, ValueError):
+                return jsonify({"error": "data/video file size limits must be integers"}), 400
+            if data_file_size_in_mb <= 0 or video_file_size_in_mb <= 0:
+                return jsonify({"error": "data/video file size limits must be positive"}), 400
+            try:
+                workers_value = options.get("workers")
+                workers = int(DEFAULT_V3_CONVERT_WORKERS if workers_value in (None, "") else workers_value)
+            except (TypeError, ValueError):
+                return jsonify({"error": "workers must be an integer"}), 400
+            if workers <= 0:
+                return jsonify({"error": "workers must be positive"}), 400
+            try:
+                image_video_mode = normalize_image_video_mode(
+                    options.get("image_video_mode") or IMAGE_VIDEO_MODE_LEROBOT_OFFICIAL
+                )
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        total = int(info.get("total_episodes") or 1)
+        dry_run = ctx.bool_option(options, "dry_run", False)
+        overwrite = ctx.bool_option(options, "overwrite", False)
+        target_root = None if source_is_v3 else (_out_root(options) or default_v3_path(src_root))
+        if target_root is not None and target_root.exists() and not dry_run and not overwrite:
+            return (
+                jsonify(
+                    {
+                        "error": f"Output dataset already exists: {target_root}",
+                        "requires_overwrite_confirmation": True,
+                        "output_root": str(target_root),
+                    }
+                ),
+                409,
+            )
+        job = _new_job(
+            "preprocess_convert_v3",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(src_root if source_is_v3 else target_root or ""),
+        )
+
+        def _run_job() -> None:
+            try:
+                ctx.update_job(job, {"status": "running", "message": "Starting LeRobot v3.0 conversion"})
+                result = run_convert_v3(
+                    src_root,
+                    out_root=target_root,
+                    data_file_size_in_mb=data_file_size_in_mb,
+                    video_file_size_in_mb=video_file_size_in_mb,
+                    workers=workers,
+                    image_video_mode=image_video_mode,
+                    overwrite=overwrite,
+                    dry_run=dry_run,
+                    progress_callback=lambda payload: ctx.update_job(job, payload),
+                )
+                output_root = str(result.out_root)
+                if result.summary.get("already_v3"):
+                    message = f"Dataset is already v3.0; no conversion is needed: {output_root}"
+                elif result.dry_run:
+                    message = f"v3.0 conversion preview complete: {output_root}"
+                else:
+                    action = str(result.summary.get("action") or "convert")
+                    message = f"v3.0 {action} complete: {output_root}"
+                ctx.finish_job(
+                    job,
+                    message,
+                    current=result.total_episodes or total,
+                    total=result.total_episodes or total,
+                    output_root=output_root,
+                )
+                with ctx.jobs_lock:
+                    ctx.append_job_log(job, f"Summary: {result.summary}")
+                    if not result.summary.get("already_v3"):
+                        ctx.append_job_log(job, "v3.0 outputs are not auto-registered in the legacy viewer.")
+            except Exception as exc:
+                logging.exception("Preprocess convert_v3 failed")
+                ctx.fail_job(job, "Preprocess convert_v3 failed", exc)
+
+        threading.Thread(target=_run_job, name=f"preprocess-v3-{job['id']}", daemon=True).start()
+        return jsonify({"job": ctx.serialize_job(job)})
+
+    @app.route("/api/preprocess/repair_v3_video_timestamps/start", methods=["POST"])
+    def api_preprocess_repair_v3_video_timestamps_start():
+        body = request.get_json(silent=True) or {}
+        options = body.get("options") or body
+        try:
+            dataset_key = ctx.dataset_key_from_body(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        index_entry = ctx.datasets_index.get(dataset_key)
+        if index_entry is None:
+            return jsonify({"error": "dataset is not registered"}), 404
+
+        root = Path(index_entry["root"]).expanduser()
+        info = load_json(root / "meta" / "info.json")
+        raw_version = str(info.get("codebase_version") or "").lower().removeprefix("v")
+        if not (raw_version == "3" or raw_version.startswith("3.")):
+            return jsonify({"error": "video timestamp repair requires a v3.0 dataset"}), 400
+        dry_run = ctx.bool_option(options, "dry_run", False)
+        total = int(info.get("total_episodes") or 1)
+        job = _new_job(
+            "preprocess_repair_v3_video_timestamps",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(root),
+        )
+
+        def _run_job() -> None:
+            try:
+                ctx.update_job(
+                    job,
+                    {
+                        "status": "running",
+                        "message": "Checking and normalizing MP4 frame PTS",
+                    },
+                )
+                result = repair_v3_video_timestamps(
+                    root,
+                    dry_run=dry_run,
+                    progress_callback=lambda payload: ctx.update_job(job, payload),
+                )
+                ctx.finish_job(
+                    job,
+                    (
+                        "v3.0 video timestamp repair preview complete"
+                        if result.dry_run
+                        else "v3.0 video timestamps remuxed without re-encoding"
+                    ),
+                    current=result.total_episodes or total,
+                    total=result.total_episodes or total,
+                    output_root=str(root),
+                )
+                with ctx.jobs_lock:
+                    ctx.append_job_log(job, f"Summary: {result.summary}")
+            except Exception as exc:
+                logging.exception("Preprocess v3 video timestamp repair failed")
+                ctx.fail_job(job, "Preprocess v3 video timestamp repair failed", exc)
+
+        threading.Thread(
+            target=_run_job,
+            name=f"preprocess-v3-timestamps-{job['id']}",
+            daemon=True,
+        ).start()
         return jsonify({"job": ctx.serialize_job(job)})
 
     @app.route("/api/preprocess/drop_field/start", methods=["POST"])
@@ -370,7 +587,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             return jsonify({"error": "field_name is required"}), 400
         dry_run = ctx.bool_option(options, "dry_run", False)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_drop_field", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or ""))
+        job = _new_job(
+            "preprocess_drop_field", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or "")
+        )
 
         def _run_job() -> None:
             try:
@@ -406,11 +625,22 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         smooth_state = ctx.bool_option(options, "smooth_state", True)
         dry_run = ctx.bool_option(options, "dry_run", False)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_smooth_action", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or ""))
+        job = _new_job(
+            "preprocess_smooth_action",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(_out_root(options) or ""),
+        )
 
         def _run_job() -> None:
             try:
-                ctx.update_job(job, {"status": "running", "message": f"Starting action smoothing, window={window}, workers={workers or 'auto'}"})
+                ctx.update_job(
+                    job,
+                    {
+                        "status": "running",
+                        "message": f"Starting action smoothing, window={window}, workers={workers or 'auto'}",
+                    },
+                )
                 result = run_smooth_action(
                     dataset_obj.root,
                     out_root=_out_root(options),
@@ -444,11 +674,15 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         dry_run = ctx.bool_option(options, "dry_run", False)
         backup = ctx.bool_option(options, "backup", True)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_rewrite_prompts", ctx.repo_id_from_key(dataset_key), total, str(dataset_obj.root))
+        job = _new_job(
+            "preprocess_rewrite_prompts", ctx.repo_id_from_key(dataset_key), total, str(dataset_obj.root)
+        )
 
         def _run_job() -> None:
             try:
-                ctx.update_job(job, {"status": "running", "current": 0, "total": 3, "message": "Starting prompt rewrite"})
+                ctx.update_job(
+                    job, {"status": "running", "current": 0, "total": 3, "message": "Starting prompt rewrite"}
+                )
                 result = run_rewrite_prompts(
                     dataset_obj.root,
                     pattern=pattern,
@@ -475,11 +709,7 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                         )
                 ctx.finish_job(
                     job,
-                    (
-                        "Prompt rewrite dry run complete"
-                        if dry_run
-                        else "Prompt rewrite complete"
-                    ),
+                    ("Prompt rewrite dry run complete" if dry_run else "Prompt rewrite complete"),
                     current=3,
                     total=3,
                     output_root=str(dataset_obj.root),
@@ -507,11 +737,24 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         dry_run = ctx.bool_option(options, "dry_run", False)
         backup = ctx.bool_option(options, "backup", True)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_fix_prompt_prepositions", ctx.repo_id_from_key(dataset_key), total, str(dataset_obj.root))
+        job = _new_job(
+            "preprocess_fix_prompt_prepositions",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(dataset_obj.root),
+        )
 
         def _run_job() -> None:
             try:
-                ctx.update_job(job, {"status": "running", "current": 0, "total": 3, "message": "Starting prompt preposition fix"})
+                ctx.update_job(
+                    job,
+                    {
+                        "status": "running",
+                        "current": 0,
+                        "total": 3,
+                        "message": "Starting prompt preposition fix",
+                    },
+                )
                 result = run_fix_prompt_prepositions(
                     dataset_obj.root,
                     dry_run=dry_run,
@@ -551,7 +794,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 logging.exception("Preprocess prompt preposition fix failed")
                 ctx.fail_job(job, "Preprocess prompt preposition fix failed", exc)
 
-        threading.Thread(target=_run_job, name=f"preprocess-fix-prompt-prepositions-{job['id']}", daemon=True).start()
+        threading.Thread(
+            target=_run_job, name=f"preprocess-fix-prompt-prepositions-{job['id']}", daemon=True
+        ).start()
         return jsonify({"job": ctx.serialize_job(job)})
 
     @app.route("/api/preprocess/apply_prompt_assignments/start", methods=["POST"])
@@ -575,7 +820,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             requested_set = {int(ep) for ep in requested_episodes}
             pending = {ep: item for ep, item in pending.items() if ep in requested_set}
         total = len(pending)
-        job = _new_job("preprocess_apply_prompt_assignments", ctx.repo_id_from_key(dataset_key), max(1, total))
+        job = _new_job(
+            "preprocess_apply_prompt_assignments", ctx.repo_id_from_key(dataset_key), max(1, total)
+        )
 
         def _run_job() -> None:
             try:
@@ -656,7 +903,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 logging.exception("Apply pending prompt assignments failed")
                 ctx.fail_job(job, "Apply pending prompt assignments failed", exc)
 
-        threading.Thread(target=_run_job, name=f"preprocess-apply-prompt-assignments-{job['id']}", daemon=True).start()
+        threading.Thread(
+            target=_run_job, name=f"preprocess-apply-prompt-assignments-{job['id']}", daemon=True
+        ).start()
         return jsonify({"job": ctx.serialize_job(job)})
 
     @app.route("/api/preprocess/lowercase_prompts/start", methods=["POST"])
@@ -718,7 +967,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 logging.exception("Prompt lowercase failed")
                 ctx.fail_job(job, "Prompt lowercase failed", exc)
 
-        threading.Thread(target=_run_job, name=f"preprocess-lowercase-prompts-{job['id']}", daemon=True).start()
+        threading.Thread(
+            target=_run_job, name=f"preprocess-lowercase-prompts-{job['id']}", daemon=True
+        ).start()
         return jsonify({"job": ctx.serialize_job(job)})
 
     @app.route("/api/preprocess/quality_flags/start", methods=["POST"])
@@ -906,7 +1157,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             default_data_version = infer_data_version_from_features(info.get("features") or {})
             data_version = _data_version_option(options, default_data_version)
             episodes = ctx.parse_int_list(options.get("episodes") or options.get("episode_ids"))
-            prepare_workers_key = "prepare_workers" if options.get("prepare_workers") not in (None, "") else "workers"
+            prepare_workers_key = (
+                "prepare_workers" if options.get("prepare_workers") not in (None, "") else "workers"
+            )
             prepare_workers = _positive_int_option(options, prepare_workers_key, 8)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
@@ -938,6 +1191,21 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                         static_folder=ds_static,
                         log=lambda message: ctx.append_job_log(job, message),
                     )
+                    remaining_ids = None
+                    refresh_dataset = getattr(
+                        ctx,
+                        "refresh_dataset_after_episode_delete",
+                        None,
+                    )
+                    clear_caches = getattr(ctx, "clear_dataset_caches", None)
+                    if refresh_dataset:
+                        remaining_ids = refresh_dataset(
+                            dataset_key,
+                            dataset_obj,
+                            ds_static,
+                        )
+                    elif clear_caches:
+                        clear_caches(dataset_key)
                     if ctx.append_operation_log:
                         ctx.append_operation_log(
                             ds_static,
@@ -953,6 +1221,11 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                         current=len(flagged_ids),
                         total=len(flagged_ids),
                         review_url=None,
+                        viewer_url=(
+                            f"/{ctx.repo_id_from_key(dataset_key)}/episode_{remaining_ids[0]}"
+                            if remaining_ids
+                            else None
+                        ),
                     )
                     with ctx.jobs_lock:
                         ctx.append_job_log(job, f"Summary: {delete_result}")
@@ -1054,7 +1327,10 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             return jsonify({"error": str(exc)}), 400
         try:
             delete_episode_ids = sorted(
-                set(ctx.parse_int_list(options.get("delete_episodes") or options.get("delete_episode_ids")) or [])
+                set(
+                    ctx.parse_int_list(options.get("delete_episodes") or options.get("delete_episode_ids"))
+                    or []
+                )
             )
         except ValueError as exc:
             return jsonify({"error": f"invalid delete episodes: {exc}"}), 400
@@ -1176,7 +1452,10 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                             details={"result": delete_result, "job_id": job["id"]},
                         )
                     result.total_episodes = int(delete_result["new_total_episodes"])
-                    result.total_frames = int(getattr(standardized_dataset, "total_frames", result.total_frames) or result.total_frames)
+                    result.total_frames = int(
+                        getattr(standardized_dataset, "total_frames", result.total_frames)
+                        or result.total_frames
+                    )
                     result.summary["delete_episodes"] = delete_result["deleted_episode_ids"]
                     result.summary["episodes_after_delete"] = delete_result["new_total_episodes"]
                 ctx.update_job(
@@ -1226,7 +1505,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             return jsonify({"error": "dataset is not registered"}), 404
         dry_run = ctx.bool_option(options, "dry_run", False)
         total = int(getattr(dataset_obj, "total_episodes", 1) or 1)
-        job = _new_job("preprocess_split", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or ""))
+        job = _new_job(
+            "preprocess_split", ctx.repo_id_from_key(dataset_key), total, str(_out_root(options) or "")
+        )
 
         def _run_job() -> None:
             try:
@@ -1329,7 +1610,10 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                         },
                     )
 
-                total = sum(int(getattr(dataset_obj, "total_episodes", 0) or 0) for dataset_obj, _ in entries) or 1
+                total = (
+                    sum(int(getattr(dataset_obj, "total_episodes", 0) or 0) for dataset_obj, _ in entries)
+                    or 1
+                )
                 ctx.update_job(
                     job,
                     {
@@ -1344,7 +1628,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                     out_root=out_root,
                     dry_run=dry_run,
                     src_static_dirs=[ds_static for _dataset_obj, ds_static in entries],
-                    out_static_dir=(get_default_output_dir(out_root) / "static") if out_root is not None else None,
+                    out_static_dir=(get_default_output_dir(out_root) / "static")
+                    if out_root is not None
+                    else None,
                     workers=workers,
                     exclude_episodes=[delete_by_key.get(key) for key in keys],
                     progress_callback=lambda payload: ctx.update_job(job, payload),
@@ -1430,7 +1716,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                     out_root=out_root,
                     dry_run=dry_run,
                     src_static_dir=base_static,
-                    out_static_dir=(get_default_output_dir(out_root) / "static") if out_root is not None else None,
+                    out_static_dir=(get_default_output_dir(out_root) / "static")
+                    if out_root is not None
+                    else None,
                     workers=workers,
                     progress_callback=lambda payload: ctx.update_job(job, payload),
                 )

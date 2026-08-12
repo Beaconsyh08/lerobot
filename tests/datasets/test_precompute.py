@@ -10,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from lerobot.data_platform import cli as prepare_script
 from lerobot.data_platform.precompute.analysis import (
     build_dataset_analysis,
     infer_task_scene,
@@ -41,7 +42,6 @@ from lerobot.data_platform.precompute.timeseries import (
     normalize_gripper_columns,
     normalize_gripper_csv_value,
 )
-from lerobot.data_platform import cli as prepare_script
 
 
 def _png_bytes(value: int) -> bytes:
@@ -263,7 +263,9 @@ def test_iter_image_bytes_supports_embedded_and_path_fallback(tmp_path: Path):
 
 def test_compute_subtask_boundaries_for_pick_place():
     timestamps, action, state, task = _build_episode_arrays(give=False)
-    boundaries, issues = compute_subtask_boundaries(timestamps, action, state, fps=10.0, episode_id=3, task=task)
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps, action, state, fps=10.0, episode_id=3, task=task
+    )
 
     assert boundaries is not None
     assert (
@@ -278,7 +280,9 @@ def test_compute_subtask_boundaries_for_pick_place():
 
 def test_compute_subtask_boundaries_for_give():
     timestamps, action, state, task = _build_episode_arrays(give=True)
-    boundaries, issues = compute_subtask_boundaries(timestamps, action, state, fps=10.0, episode_id=4, task=task)
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps, action, state, fps=10.0, episode_id=4, task=task
+    )
 
     assert boundaries is not None
     assert boundaries["is_give"] is True
@@ -299,7 +303,9 @@ def test_compute_subtask_boundaries_for_direct_give_skips_grasp_stages():
     action[:65, 7] = 1.0
     state[:68, 7] = 1.0
 
-    boundaries, issues = compute_subtask_boundaries(timestamps, action, state, fps=10.0, episode_id=4, task=task)
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps, action, state, fps=10.0, episode_id=4, task=task
+    )
 
     assert boundaries is not None
     assert boundaries["is_give"] is True
@@ -319,7 +325,9 @@ def test_compute_subtask_boundaries_for_give_flags_more_than_two_gripper_transit
     timestamps, action, state, task = _build_episode_arrays(give=True)
     action[70:, 7] = 1.0
     state[72:, 7] = 1.0
-    boundaries, issues = compute_subtask_boundaries(timestamps, action, state, fps=10.0, episode_id=4, task=task)
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps, action, state, fps=10.0, episode_id=4, task=task
+    )
 
     assert boundaries is not None
     multi = [issue for issue in issues if issue["type"] == "multi_gripper"]
@@ -332,10 +340,99 @@ def test_compute_subtask_boundaries_returns_issue_when_transition_missing():
     action[:, 7] = 0.0
     state[:, 7] = 0.0
 
-    boundaries, issues = compute_subtask_boundaries(timestamps, action, state, fps=10.0, episode_id=5, task=task)
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps, action, state, fps=10.0, episode_id=5, task=task
+    )
 
     assert boundaries is None
     assert issues and issues[0]["type"] == "error"
+
+
+def test_compute_subtask_boundaries_uses_equal_time_stages_for_other_tasks():
+    timestamps = np.linspace(0.0, 10.0, 11, dtype=np.float32)
+    action = np.zeros((len(timestamps), 16), dtype=np.float32)
+
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps,
+        action,
+        None,
+        fps=1.0,
+        episode_id=6,
+        task="move the cube in a circle",
+    )
+
+    assert issues == []
+    assert boundaries == {
+        "equal_time": True,
+        "num_stages": 5,
+        "stage_boundaries": [2.0, 4.0, 6.0, 8.0],
+    }
+    assert assign_subtask_states(timestamps, boundaries) == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+        4,
+        4,
+        4,
+    ]
+
+
+def test_compute_subtask_boundaries_allows_adjusting_equal_time_stage_count(tmp_path: Path):
+    timestamps = np.linspace(0.0, 9.0, 10, dtype=np.float32)
+    action = np.zeros((len(timestamps), 16), dtype=np.float32)
+
+    boundaries, issues = compute_subtask_boundaries(
+        timestamps,
+        action,
+        None,
+        fps=1.0,
+        task="rotate the cube",
+        fallback_stage_count=3,
+    )
+
+    assert issues == []
+    assert boundaries["stage_boundaries"] == [3.0, 6.0]
+    assert assign_subtask_states(timestamps, boundaries) == [
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+    ]
+
+    prepare_script._write_subtask_annotations(tmp_path, {"0": boundaries}, True)
+    annotations = json.loads((tmp_path / "subtask_annotations.json").read_text())
+    assert annotations == {
+        "0": [
+            {"time": 3.0, "state": 1},
+            {"time": 6.0, "state": 2},
+        ]
+    }
+
+
+def test_compute_subtask_boundaries_rejects_invalid_equal_time_stage_count():
+    timestamps = np.linspace(0.0, 1.0, 3, dtype=np.float32)
+    action = np.zeros((len(timestamps), 16), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="fallback_stage_count must be at least 2"):
+        compute_subtask_boundaries(
+            timestamps,
+            action,
+            None,
+            fps=2.0,
+            task="rotate the cube",
+            fallback_stage_count=1,
+        )
 
 
 def test_compute_subtask_boundaries_accepts_new_gripper_0_100_encoding():
@@ -710,8 +807,12 @@ def test_run_quality_flag_detection_refreshes_quality_flags_only(tmp_path: Path)
     state1 = np.zeros((20, 18), dtype=np.float32)
     subtask_state = np.array([0] * 5 + [1] * 5 + [2] * 5 + [3] * 5, dtype=np.int32)
 
-    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, action=action0, state=state0, subtask_state=subtask_state)
-    _write_episode_parquet(dataset_root, 1, timestamps=timestamps, action=action1, state=state1, subtask_state=subtask_state)
+    _write_episode_parquet(
+        dataset_root, 0, timestamps=timestamps, action=action0, state=state0, subtask_state=subtask_state
+    )
+    _write_episode_parquet(
+        dataset_root, 1, timestamps=timestamps, action=action1, state=state1, subtask_state=subtask_state
+    )
     (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
     info = {
         "total_episodes": 2,
@@ -767,7 +868,9 @@ def test_run_quality_flag_detection_overwrite_can_clear_manual_flags(tmp_path: P
     action[1:, 7] = 100.0
     subtask_state = np.array([0] * 5 + [1] * 5 + [2] * 5 + [3] * 5, dtype=np.int32)
 
-    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state)
+    _write_episode_parquet(
+        dataset_root, 0, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state
+    )
     (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
     (dataset_root / "meta" / "info.json").write_text(
         json.dumps(
@@ -824,8 +927,12 @@ def test_run_quality_flag_detection_syncs_prompt_action_mismatch_tags(tmp_path: 
     state = np.zeros((20, 18), dtype=np.float32)
     subtask_state = np.array([0] * 5 + [1] * 5 + [2] * 5 + [3] * 5, dtype=np.int32)
 
-    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state)
-    _write_episode_parquet(dataset_root, 1, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state)
+    _write_episode_parquet(
+        dataset_root, 0, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state
+    )
+    _write_episode_parquet(
+        dataset_root, 1, timestamps=timestamps, action=action, state=state, subtask_state=subtask_state
+    )
     (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
     info = {
         "total_episodes": 2,
@@ -891,8 +998,12 @@ def test_run_quality_flag_detection_preserves_unscanned_auto_flag_reasons(tmp_pa
     state1 = np.zeros((20, 18), dtype=np.float32)
     subtask_state = np.array([0] * 5 + [1] * 5 + [2] * 5 + [3] * 5, dtype=np.int32)
 
-    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, action=action0, state=state0, subtask_state=subtask_state)
-    _write_episode_parquet(dataset_root, 1, timestamps=timestamps, action=action1, state=state1, subtask_state=subtask_state)
+    _write_episode_parquet(
+        dataset_root, 0, timestamps=timestamps, action=action0, state=state0, subtask_state=subtask_state
+    )
+    _write_episode_parquet(
+        dataset_root, 1, timestamps=timestamps, action=action1, state=state1, subtask_state=subtask_state
+    )
     (dataset_root / "meta").mkdir(parents=True, exist_ok=True)
     (dataset_root / "meta" / "info.json").write_text(
         json.dumps(
@@ -935,7 +1046,9 @@ def test_run_quality_flag_detection_preserves_unscanned_auto_flag_reasons(tmp_pa
     )
     (static_dir / "flagged_episodes.json").write_text(json.dumps({"flagged_episodes": [1]}))
 
-    run_quality_flag_detection(dataset_root, static_dir, episodes=[0], data_version=DATA_VERSION_DVT2, workers=1)
+    run_quality_flag_detection(
+        dataset_root, static_dir, episodes=[0], data_version=DATA_VERSION_DVT2, workers=1
+    )
 
     quality_flags = json.loads((static_dir / "quality_flagged_episodes.json").read_text())
     assert quality_flags["flagged_episodes"] == [0, 1]
@@ -1179,7 +1292,9 @@ def test_apply_task_assignment_choice_updates_metadata_parquet_and_flags(tmp_pat
     }
     (dataset_root / "meta" / "info.json").write_text(json.dumps(info))
     with jsonlines.open(dataset_root / "meta" / "episodes.jsonl", mode="w") as writer:
-        writer.write({"episode_index": 0, "tasks": ["Pick up the cube", "Pick up the yellow duck"], "length": 20})
+        writer.write(
+            {"episode_index": 0, "tasks": ["Pick up the cube", "Pick up the yellow duck"], "length": 20}
+        )
     with jsonlines.open(dataset_root / "meta" / "tasks.jsonl", mode="w") as writer:
         writer.write({"task_index": 0, "task": "Pick up the cube"})
         writer.write({"task_index": 1, "task": "Pick up the yellow duck"})
@@ -1191,7 +1306,9 @@ def test_apply_task_assignment_choice_updates_metadata_parquet_and_flags(tmp_pat
     result = apply_task_assignment_choice(dataset_root, static_dir, 0, "Pick up the yellow duck")
 
     assert result["removed_issues"] == 1
-    episodes = [json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()]
+    episodes = [
+        json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()
+    ]
     assert episodes[0]["tasks"] == ["Pick up the yellow duck"]
     table = pq.read_table(parquet_path, columns=["task_index"])
     assert set(table["task_index"].to_pylist()) == {1}
@@ -1283,14 +1400,19 @@ def test_prompt_action_mismatch_task_assignment_candidates_and_save(tmp_path: Pa
     result = apply_task_assignment_choice(dataset_root, static_dir, 0, "Pick up the brown dog")
 
     assert result["removed_issues"] == 1
-    episodes = [json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()]
+    episodes = [
+        json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()
+    ]
     assert episodes[0]["tasks"] == ["Pick up the brown dog"]
     table = pq.read_table(parquet_path, columns=["task_index"])
     assert set(table["task_index"].to_pylist()) == {1}
     assert json.loads((static_dir / "annotation_issues.json").read_text()) == []
-    assert json.loads((static_dir / "tagging_prompt_mismatch_flagged_episodes.json").read_text())[
-        "flagged_episodes"
-    ] == []
+    assert (
+        json.loads((static_dir / "tagging_prompt_mismatch_flagged_episodes.json").read_text())[
+            "flagged_episodes"
+        ]
+        == []
+    )
     assert json.loads((static_dir / "flagged_episodes.json").read_text())["flagged_episodes"] == []
 
 
@@ -1357,7 +1479,9 @@ def test_manual_prompt_error_task_assignment_uses_prompt_repair_path(tmp_path: P
     )
 
     assert result["task_index"] == 2
-    episodes = [json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()]
+    episodes = [
+        json.loads(line) for line in (dataset_root / "meta" / "episodes.jsonl").read_text().splitlines()
+    ]
     assert episodes[0]["tasks"] == ["Pick up the green dinosaur"]
     tasks = [json.loads(line) for line in (dataset_root / "meta" / "tasks.jsonl").read_text().splitlines()]
     assert tasks[-1] == {"task_index": 2, "task": "Pick up the green dinosaur"}
@@ -1479,9 +1603,12 @@ def test_prompt_action_mismatch_candidates_from_auto_flag_file(tmp_path: Path):
 
     apply_task_assignment_choice(dataset_root, static_dir, 0, "Pick up the brown dog")
 
-    assert json.loads((static_dir / "tagging_prompt_mismatch_flagged_episodes.json").read_text())[
-        "flagged_episodes"
-    ] == []
+    assert (
+        json.loads((static_dir / "tagging_prompt_mismatch_flagged_episodes.json").read_text())[
+            "flagged_episodes"
+        ]
+        == []
+    )
     assert json.loads((static_dir / "flagged_episodes.json").read_text())["flagged_episodes"] == []
 
 
@@ -1611,9 +1738,7 @@ def _make_delete_dataset(root: Path) -> DummyDataset:
 
 def _file_snapshot(root: Path) -> dict[str, bytes]:
     return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
+        str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()
     }
 
 
@@ -1813,8 +1938,18 @@ def test_labeling_missing_target_flags_replace_auto_flags_and_keep_manual(tmp_pa
     (static_dir / "annotation_issues.json").write_text(
         json.dumps(
             [
-                {"episode": 0, "type": "object_labeling", "reason": "missing_target_detection", "task": "old"},
-                {"episode": 2, "type": "object_labeling", "reason": "missing_target_detection", "task": "old"},
+                {
+                    "episode": 0,
+                    "type": "object_labeling",
+                    "reason": "missing_target_detection",
+                    "task": "old",
+                },
+                {
+                    "episode": 2,
+                    "type": "object_labeling",
+                    "reason": "missing_target_detection",
+                    "task": "old",
+                },
                 {"episode": 2, "type": "error", "reason": "existing_stage_issue"},
             ]
         )
@@ -1852,9 +1987,15 @@ def test_labeling_missing_target_flags_replace_auto_flags_and_keep_manual(tmp_pa
 
     issues = json.loads((static_dir / "annotation_issues.json").read_text())
     assert summary["missing_target_count"] == 1
-    assert any(issue.get("episode") == 0 and issue.get("reason") == "missing_target_detection" for issue in issues)
-    assert not any(issue.get("episode") == 2 and issue.get("reason") == "missing_target_detection" for issue in issues)
-    assert not any(issue.get("episode") == 4 and issue.get("reason") == "missing_target_detection" for issue in issues)
+    assert any(
+        issue.get("episode") == 0 and issue.get("reason") == "missing_target_detection" for issue in issues
+    )
+    assert not any(
+        issue.get("episode") == 2 and issue.get("reason") == "missing_target_detection" for issue in issues
+    )
+    assert not any(
+        issue.get("episode") == 4 and issue.get("reason") == "missing_target_detection" for issue in issues
+    )
     assert {"episode": 2, "type": "error", "reason": "existing_stage_issue"} in issues
     assert json.loads((static_dir / "labeling_flagged_episodes.json").read_text())["flagged_episodes"] == [0]
     assert json.loads((static_dir / "flagged_episodes.json").read_text())["flagged_episodes"] == [0, 3]
@@ -1923,17 +2064,10 @@ def test_build_dataset_analysis_uses_exist_label_and_duration_buckets(tmp_path: 
     csv_dir = static_dir / "csv"
     csv_dir.mkdir(parents=True)
     (csv_dir / "episode_000000_ds1.csv").write_text(
-        "timestamp,stage,yellow duck,brown dog,exist\n"
-        "0,0,1,0,1\n"
-        "2,2,1,0,1\n"
-        "4,2,1,0,1\n"
-        "6,1,1,0,1\n"
+        "timestamp,stage,yellow duck,brown dog,exist\n0,0,1,0,1\n2,2,1,0,1\n4,2,1,0,1\n6,1,1,0,1\n"
     )
     (csv_dir / "episode_000001_ds1.csv").write_text(
-        "timestamp,stage,yellow duck,brown dog,exist\n"
-        "0,0,0,1,1\n"
-        "6,2,0,1,1\n"
-        "12,1,0,1,1\n"
+        "timestamp,stage,yellow duck,brown dog,exist\n0,0,0,1,1\n6,2,0,1,1\n12,1,0,1,1\n"
     )
 
     meta = DummyMeta(
@@ -2055,7 +2189,9 @@ def test_write_episode_csv_writes_exist_label_columns(tmp_path: Path):
             "names": ["yellow duck", "brown dog", "orange lion", "green dinosaur"],
         },
     }
-    meta = DummyMeta(dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the yellow duck"], "length": 3}})
+    meta = DummyMeta(
+        dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the yellow duck"], "length": 3}}
+    )
     out_path = tmp_path / "static" / "csv" / "episode_000000_ds1.csv"
 
     ok, boundaries, issues = write_episode_csv(
@@ -2085,7 +2221,9 @@ def test_write_episode_csv_writes_scalar_exist_label_column(tmp_path: Path):
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "exist_label": {"dtype": "int32", "shape": [1], "names": None},
     }
-    meta = DummyMeta(dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the yellow duck"], "length": 2}})
+    meta = DummyMeta(
+        dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the yellow duck"], "length": 2}}
+    )
     out_path = tmp_path / "static" / "csv" / "episode_000000_ds1.csv"
 
     ok, boundaries, issues = write_episode_csv(

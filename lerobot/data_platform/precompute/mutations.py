@@ -12,6 +12,15 @@ from tqdm.auto import tqdm
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.data_platform.precompute.annotation import assign_subtask_states
+from lerobot.data_platform.precompute.dataset_io import (
+    V3DatasetMetadata,
+    is_v3_dataset,
+    is_v3_metadata,
+    read_episode_table,
+    replace_episode_column,
+    update_episode_metadata,
+    upsert_episode_column,
+)
 from lerobot.data_platform.task_text import generate_subtask_text
 
 
@@ -34,6 +43,50 @@ def update_info_features(dataset_root: Path, new_features: dict[str, dict]) -> b
 
 
 def update_episode_stats_for_subtask_state(dataset_root: Path, episode_stats: dict[int, dict]) -> bool:
+    if is_v3_dataset(dataset_root):
+        updates = {
+            int(episode_id): {
+                f"stats/subtask_state/{stat_name}": stat_value for stat_name, stat_value in stats.items()
+            }
+            for episode_id, stats in episode_stats.items()
+        }
+        changed = bool(update_episode_metadata(dataset_root, updates))
+        if not changed:
+            return False
+
+        meta = V3DatasetMetadata(f"local/{Path(dataset_root).name}", dataset_root)
+        all_feature_stats = [
+            stats["subtask_state"]
+            for stats in meta.episodes_stats.values()
+            if "subtask_state" in stats and stats["subtask_state"].get("count") is not None
+        ]
+        counts = np.asarray(
+            [float(stats["count"][0]) for stats in all_feature_stats],
+            dtype=np.float64,
+        )
+        means = np.asarray(
+            [float(stats["mean"][0]) for stats in all_feature_stats],
+            dtype=np.float64,
+        )
+        stds = np.asarray(
+            [float(stats["std"][0]) for stats in all_feature_stats],
+            dtype=np.float64,
+        )
+        total = float(counts.sum())
+        mean = float(np.sum(counts * means) / total) if total else 0.0
+        variance = float(np.sum(counts * (stds**2 + means**2)) / total - mean**2) if total else 0.0
+        stats_path = Path(dataset_root) / "meta" / "stats.json"
+        global_stats = json.loads(stats_path.read_text()) if stats_path.is_file() else {}
+        global_stats["subtask_state"] = {
+            "min": [min(int(stats["min"][0]) for stats in all_feature_stats)],
+            "max": [max(int(stats["max"][0]) for stats in all_feature_stats)],
+            "mean": [mean],
+            "std": [float(np.sqrt(max(0.0, variance)))],
+            "count": [int(total)],
+        }
+        stats_path.write_text(json.dumps(global_stats, indent=2))
+        return True
+
     stats_path = dataset_root / "meta" / "episodes_stats.jsonl"
     if not stats_path.is_file() or not episode_stats:
         return False
@@ -74,7 +127,7 @@ def write_subtask_state_to_parquet(
                 progress.update(1)
                 continue
 
-            table = pq.read_table(parquet_path)
+            table = read_episode_table(dataset_root, meta, episode_id)
             timestamps = table.column("timestamp").to_numpy()
             states = assign_subtask_states(timestamps, bounds)
             none_indices = [idx for idx, state in enumerate(states) if state is None]
@@ -86,16 +139,25 @@ def write_subtask_state_to_parquet(
                     none_indices,
                 )
 
-            column = pa.array(states, type=pa.int32())
-            if "subtask_state" in table.column_names:
-                column_idx = table.column_names.index("subtask_state")
-                table = table.set_column(column_idx, "subtask_state", column)
+            if is_v3_metadata(meta):
+                upsert_episode_column(
+                    dataset_root,
+                    meta,
+                    episode_id,
+                    "subtask_state",
+                    states,
+                    pa.int32(),
+                )
             else:
-                table = table.append_column("subtask_state", column)
-
-            tmp_path = parquet_path.with_suffix(".tmp")
-            pq.write_table(table, tmp_path)
-            tmp_path.rename(parquet_path)
+                column = pa.array(states, type=pa.int32())
+                if "subtask_state" in table.column_names:
+                    column_idx = table.column_names.index("subtask_state")
+                    table = table.set_column(column_idx, "subtask_state", column)
+                else:
+                    table = table.append_column("subtask_state", column)
+                tmp_path = parquet_path.with_suffix(".tmp")
+                pq.write_table(table, tmp_path)
+                tmp_path.rename(parquet_path)
 
             arr = np.array(states, dtype=np.float64)
             all_episode_stats[episode_id] = {
@@ -128,13 +190,20 @@ def write_subtask_text_to_parquet(
                 progress.update(1)
                 continue
 
-            table = pq.read_table(parquet_path)
+            table = read_episode_table(dataset_root, meta, episode_id)
             if "subtask_state" not in table.column_names:
                 logging.warning("Episode %d: no subtask_state in parquet, skipping subtask text", episode_id)
                 progress.update(1)
                 continue
 
             states = table.column("subtask_state").to_pylist()
+            if not states or all(state is None for state in states):
+                logging.warning(
+                    "Episode %d: subtask_state is empty, skipping subtask text",
+                    episode_id,
+                )
+                progress.update(1)
+                continue
             task = ""
             if hasattr(meta, "episodes") and episode_id in meta.episodes:
                 tasks = meta.episodes[episode_id].get("tasks", [])
@@ -143,21 +212,39 @@ def write_subtask_text_to_parquet(
             if "exist" in table.column_names:
                 exist_vals = table.column("exist").to_pylist()
                 states = [-1 if int(exist_vals[idx]) == 0 else state for idx, state in enumerate(states)]
-                state_col = pa.array(states, type=pa.int32())
-                state_idx = table.column_names.index("subtask_state")
-                table = table.set_column(state_idx, "subtask_state", state_col)
+                if is_v3_metadata(meta):
+                    replace_episode_column(
+                        dataset_root,
+                        meta,
+                        episode_id,
+                        "subtask_state",
+                        states,
+                    )
+                else:
+                    state_col = pa.array(states, type=pa.int32())
+                    state_idx = table.column_names.index("subtask_state")
+                    table = table.set_column(state_idx, "subtask_state", state_col)
 
             subtask_texts = [generate_subtask_text(task, state) for state in states]
-            subtask_col = pa.array(subtask_texts, type=pa.string())
-            if "subtask" in table.column_names:
-                subtask_idx = table.column_names.index("subtask")
-                table = table.set_column(subtask_idx, "subtask", subtask_col)
+            if is_v3_metadata(meta):
+                upsert_episode_column(
+                    dataset_root,
+                    meta,
+                    episode_id,
+                    "subtask",
+                    subtask_texts,
+                    pa.string(),
+                )
             else:
-                table = table.append_column("subtask", subtask_col)
-
-            tmp_path = parquet_path.with_suffix(".tmp")
-            pq.write_table(table, tmp_path)
-            tmp_path.rename(parquet_path)
+                subtask_col = pa.array(subtask_texts, type=pa.string())
+                if "subtask" in table.column_names:
+                    subtask_idx = table.column_names.index("subtask")
+                    table = table.set_column(subtask_idx, "subtask", subtask_col)
+                else:
+                    table = table.append_column("subtask", subtask_col)
+                tmp_path = parquet_path.with_suffix(".tmp")
+                pq.write_table(table, tmp_path)
+                tmp_path.rename(parquet_path)
             written += 1
             progress.update(1)
 
@@ -208,6 +295,89 @@ def fix_episode_indices(
     episodes: list[int],
 ) -> bool:
     """Fix frame_index/index/timestamp so each episode starts at zero and global indices are contiguous."""
+    if is_v3_metadata(meta):
+        any_fixed = False
+        global_offset = 0
+        length_updates = {}
+        metadata_updates = {}
+        for episode_id in tqdm(
+            sorted(episodes),
+            desc="Fixing episode indices",
+            unit="episode",
+            dynamic_ncols=True,
+        ):
+            table = read_episode_table(
+                dataset_root,
+                meta,
+                episode_id,
+                columns=[
+                    name
+                    for name in ("frame_index", "timestamp", "index")
+                    if name in pq.read_schema(Path(dataset_root) / meta.get_data_file_path(episode_id)).names
+                ],
+            )
+            num_rows = int(table.num_rows)
+            if "frame_index" in table.column_names and not _is_contiguous_range(
+                table["frame_index"], 0, num_rows
+            ):
+                replace_episode_column(
+                    dataset_root,
+                    meta,
+                    episode_id,
+                    "frame_index",
+                    list(range(num_rows)),
+                )
+                any_fixed = True
+            if "timestamp" in table.column_names:
+                offset = _first_timestamp_offset(table["timestamp"])
+                if offset is not None:
+                    values = (
+                        _column_to_numpy(table["timestamp"]).astype(np.float64, copy=False) - offset
+                    ).tolist()
+                    replace_episode_column(
+                        dataset_root,
+                        meta,
+                        episode_id,
+                        "timestamp",
+                        values,
+                    )
+                    any_fixed = True
+            if "index" in table.column_names and not _is_contiguous_range(
+                table["index"], global_offset, num_rows
+            ):
+                replace_episode_column(
+                    dataset_root,
+                    meta,
+                    episode_id,
+                    "index",
+                    list(range(global_offset, global_offset + num_rows)),
+                )
+                any_fixed = True
+
+            recorded_length = int(meta.episodes.get(episode_id, {}).get("length", num_rows))
+            if recorded_length != num_rows:
+                length_updates[episode_id] = num_rows
+                any_fixed = True
+            metadata_updates[episode_id] = {
+                "length": num_rows,
+                "dataset_from_index": global_offset,
+                "dataset_to_index": global_offset + num_rows,
+            }
+            global_offset += num_rows
+
+        if metadata_updates:
+            update_episode_metadata(dataset_root, metadata_updates)
+            for episode_id, fields in metadata_updates.items():
+                meta.episodes[episode_id].update(fields)
+        info_path = Path(dataset_root) / "meta" / "info.json"
+        info = json.loads(info_path.read_text())
+        if int(info.get("total_frames") or 0) != global_offset:
+            info["total_frames"] = global_offset
+            info_path.write_text(json.dumps(info, indent=2))
+            meta.info["total_frames"] = global_offset
+            any_fixed = True
+        return any_fixed
+
     any_fixed = False
     global_offset = 0
     total_frames = 0
@@ -221,7 +391,9 @@ def fix_episode_indices(
     ):
         parquet_path = dataset_root / meta.get_data_file_path(episode_id)
         if not parquet_path.is_file():
-            logging.warning("Episode %d: parquet not found at %s, skipping index fix", episode_id, parquet_path)
+            logging.warning(
+                "Episode %d: parquet not found at %s, skipping index fix", episode_id, parquet_path
+            )
             continue
 
         parquet_file = pq.ParquetFile(parquet_path)

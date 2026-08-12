@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from io import BytesIO
 import hashlib
 import importlib
 import json
@@ -13,12 +12,13 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 
-from lerobot.data_platform.precompute.image_io import read_image_bytes
+from lerobot.data_platform.precompute.dataset_io import read_episode_frame_image
 
 try:
     import torch
@@ -126,8 +126,11 @@ def _uv_bin() -> str:
 
 
 def _detect_gpu_count() -> int:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return 0
     try:
-        proc = subprocess.run(["nvidia-smi", "-L"], check=False, capture_output=True, text=True, timeout=5)
+        proc = subprocess.run([nvidia_smi, "-L"], check=False, capture_output=True, text=True, timeout=5)
     except Exception:
         return 0
     if proc.returncode != 0:
@@ -168,6 +171,7 @@ def default_openpi_workers() -> int:
 def _ensure_openpi_importable():
     try:
         import openpi  # noqa: F401
+
         return
     except ModuleNotFoundError as exc:
         if exc.name != "openpi":
@@ -274,7 +278,14 @@ def resolve_openpi_config(ckpt_path: Path | None, explicit_config: str | None = 
 def _summarize_timing_rows(rows: list[dict]) -> dict:
     if not rows:
         return {"count": 0}
-    keys = sorted({key for row in rows for key, value in row.items() if isinstance(value, (int, float, np.integer, np.floating))})
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key, value in row.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+    )
     summary = {"count": len(rows)}
     for key in keys:
         values = np.asarray([float(row[key]) for row in rows if key in row], dtype=np.float64)
@@ -378,7 +389,9 @@ class OpenPISubprocessWorker:
             text=True,
             bufsize=1,
         )
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, name="openpi-embedding-stderr", daemon=True)
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="openpi-embedding-stderr", daemon=True
+        )
         self._stderr_thread.start()
         ready = self._read_response()
         if ready.get("status") != "ready":
@@ -420,7 +433,8 @@ class OpenPISubprocessWorker:
         try:
             roundtrip_start = time.perf_counter()
             self.proc.stdin.write(
-                json.dumps({"path": str(payload_path), "manifest": str(manifest_path), "count": len(raws)}) + "\n"
+                json.dumps({"path": str(payload_path), "manifest": str(manifest_path), "count": len(raws)})
+                + "\n"
             )
             self.proc.stdin.flush()
             response = self._read_response()
@@ -447,13 +461,11 @@ class OpenPISubprocessWorker:
             return
         proc = self.proc
         self.proc = None
-        try:
+        with suppress(Exception):
             if proc.stdin is not None:
                 proc.stdin.write(json.dumps({"stop": True}) + "\n")
                 proc.stdin.flush()
                 proc.stdin.close()
-        except Exception:
-            pass
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -509,12 +521,16 @@ class PolicyEmbedder:
                 self.policy = self._load_openpi_policy()
             else:
                 if self.ckpt_path is None:
-                    raise ValueError("OpenPI embedding requires a checkpoint path. Use episode_stats_fallback for stats-only embeddings.")
+                    raise ValueError(
+                        "OpenPI embedding requires a checkpoint path. Use episode_stats_fallback for stats-only embeddings."
+                    )
                 worker_count = max(1, int(workers or default_openpi_workers()))
                 device_list = _split_devices(devices if devices is not None else default_openpi_devices())
                 for idx in range(worker_count):
                     device = device_list[idx % len(device_list)] if device_list else None
-                    worker = OpenPISubprocessWorker(self.ckpt_path, self.openpi_config, self.layer_hook, device)
+                    worker = OpenPISubprocessWorker(
+                        self.ckpt_path, self.openpi_config, self.layer_hook, device
+                    )
                     self.workers.append(worker)
                     self._worker_queue.put(worker)
                 self.worker = self.workers[0]
@@ -544,14 +560,19 @@ class PolicyEmbedder:
     def timing_summary(self) -> dict:
         worker_rows = [row for worker in self.workers for row in worker.timings]
         per_worker = [
-            {"device": worker.device, "profile": worker.timing_summary()}
-            for worker in self.workers
+            {"device": worker.device, "profile": worker.timing_summary()} for worker in self.workers
         ]
-        return {"workers": len(self.workers), "overall": _summarize_timing_rows(worker_rows), "per_worker": per_worker}
+        return {
+            "workers": len(self.workers),
+            "overall": _summarize_timing_rows(worker_rows),
+            "per_worker": per_worker,
+        }
 
     def _load_openpi_policy(self):
         if self.ckpt_path is None:
-            raise ValueError("OpenPI embedding requires a checkpoint path. Use episode_stats_fallback for stats-only embeddings.")
+            raise ValueError(
+                "OpenPI embedding requires a checkpoint path. Use episode_stats_fallback for stats-only embeddings."
+            )
         _ensure_openpi_importable()
         from openpi.policies import policy_config as _policy_config
         from openpi.training import config as _config
@@ -639,18 +660,28 @@ class PolicyEmbedder:
     @staticmethod
     def _image_keys(meta) -> list[str]:
         features = getattr(meta, "features", {}) or {}
-        return [key for key, spec in features.items() if isinstance(spec, dict) and spec.get("dtype") == "image"]
+        return [
+            key
+            for key, spec in features.items()
+            if isinstance(spec, dict) and spec.get("dtype") in {"image", "video"}
+        ]
 
     @staticmethod
-    def _image_array(parquet_path: Path, root: Path, image_key: str, frame_index: int) -> np.ndarray:
-        try:
-            from PIL import Image
-        except Exception as exc:
-            raise RuntimeError("Pillow is required for OpenPI embedding image decoding") from exc
-        image_bytes = read_image_bytes(parquet_path, root, image_key, frame_index)
-        if image_bytes is None:
-            raise ValueError(f"Could not read image {image_key!r} frame {frame_index} from {parquet_path}")
-        return np.asarray(Image.open(BytesIO(image_bytes)).convert("RGB"))
+    def _image_array(
+        root: Path,
+        meta,
+        episode_index: int,
+        image_key: str,
+        frame_index: int,
+    ) -> np.ndarray:
+        image, _ = read_episode_frame_image(
+            root,
+            meta,
+            episode_index,
+            frame_index,
+            image_key=image_key,
+        )
+        return np.asarray(image)
 
     @staticmethod
     def _episode_task(meta, row: dict, episode_index: int) -> tuple[str, int]:
@@ -673,11 +704,19 @@ class PolicyEmbedder:
             task_text = str(row.get("prompt") or row.get("task") or "")
         return task_text, task_index_int
 
-    def _raw_frame(self, *, table, root: Path, parquet_path: Path, meta, episode_index: int, frame_index: int) -> dict:
+    def _raw_frame(
+        self, *, table, root: Path, parquet_path: Path, meta, episode_index: int, frame_index: int
+    ) -> dict:
         row = table.slice(frame_index, 1).to_pylist()[0]
         raw = {key: self._as_numpy_value(value) for key, value in row.items()}
         for image_key in self._image_keys(meta):
-            raw[image_key] = self._image_array(parquet_path, root, image_key, frame_index)
+            raw[image_key] = self._image_array(
+                root,
+                meta,
+                episode_index,
+                image_key,
+                frame_index,
+            )
         self._add_image_aliases(raw)
         self._add_state_action_aliases(raw)
         task_text, task_index = self._episode_task(meta, row, episode_index)
@@ -781,7 +820,9 @@ class PolicyEmbedder:
             return self._embed_openpi_frame_torch(raw)
         return self._embed_openpi_frame_jax(raw)
 
-    def _pool_prefix(self, prefix_out: np.ndarray, prefix_mask: np.ndarray, prompt_len: int = 0, stage_tokens: int = 0) -> np.ndarray:
+    def _pool_prefix(
+        self, prefix_out: np.ndarray, prefix_mask: np.ndarray, prompt_len: int = 0, stage_tokens: int = 0
+    ) -> np.ndarray:
         prefix_out = np.asarray(prefix_out, dtype=np.float32)
         prefix_mask = np.asarray(prefix_mask).astype(bool)
         if prefix_out.ndim == 3:
@@ -820,8 +861,15 @@ class PolicyEmbedder:
             mask=prefix_attn_mask,
             positions=positions,
         )
-        prompt_len = int(observation.tokenized_prompt.shape[1]) if observation.tokenized_prompt is not None else 0
-        stage_tokens = 4 if getattr(self.policy._model, "use_stage_fusion", False) and observation.subtask_state is not None else 0
+        prompt_len = (
+            int(observation.tokenized_prompt.shape[1]) if observation.tokenized_prompt is not None else 0
+        )
+        stage_tokens = (
+            4
+            if getattr(self.policy._model, "use_stage_fusion", False)
+            and observation.subtask_state is not None
+            else 0
+        )
         return self._pool_prefix(np.asarray(prefix_out), np.asarray(prefix_mask), prompt_len, stage_tokens)
 
     def _embed_openpi_frame_torch(self, raw: dict) -> np.ndarray:
@@ -832,10 +880,7 @@ class PolicyEmbedder:
         inputs = self.policy._input_transform(dict(raw))
         inputs.pop("prompt_text", None)
         device = self.policy._pytorch_device
-        torch_inputs = {
-            key: value
-            for key, value in inputs.items()
-        }
+        torch_inputs = dict(inputs)
         torch_inputs = jax.tree.map(
             lambda x: torch.from_numpy(np.array(x)).to(device)[None, ...],
             torch_inputs,
@@ -843,8 +888,12 @@ class PolicyEmbedder:
         observation = _model.Observation.from_dict(torch_inputs)
         model = self.policy._model
         with torch.no_grad():
-            images, img_masks, lang_tokens, lang_masks, _state = model._preprocess_observation(observation, train=False)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+            images, img_masks, lang_tokens, lang_masks, _state = model._preprocess_observation(
+                observation, train=False
+            )
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
             att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             att_4d = model._prepare_attention_masks_4d(att_2d)
             position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

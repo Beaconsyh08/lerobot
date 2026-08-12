@@ -7,20 +7,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
 
-import pyarrow.parquet as pq
-
-from lerobot.data_platform.precompute.labeling.review import image_keys_from_meta, read_first_frame_image, read_frame_image
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
+from lerobot.data_platform.precompute.labeling.review import (
+    image_keys_from_meta,
+    read_first_frame_image,
+    read_frame_image,
+)
 from lerobot.data_platform.precompute.labeling.task_parser import normalize_object_name, parse_task
 from lerobot.data_platform.precompute.tagging.geometric_backend import (
     build_grasp_heatmap,
     grasp_xy_from_trajectory,
     trajectory_xy_details_from_table,
 )
-from lerobot.data_platform.precompute.tagging.review import source_path, tags_path
-from lerobot.data_platform.precompute.tagging.review import load_tags_jsonl, merge_tag_record
+from lerobot.data_platform.precompute.tagging.review import (
+    load_tags_jsonl,
+    merge_tag_record,
+    source_path,
+    tags_path,
+)
 from lerobot.data_platform.precompute.tagging.rule_backend import arm_from_action
 from lerobot.data_platform.precompute.tagging.schema import DEFAULT_VLM_MODEL, selected_tag_defs
-from lerobot.data_platform.precompute.tagging.vlm_backend import VLMTagger, get_capabilities as get_vlm_capabilities
+from lerobot.data_platform.precompute.tagging.vlm_backend import VLMTagger
+from lerobot.data_platform.precompute.tagging.vlm_backend import (
+    get_capabilities as get_vlm_capabilities,
+)
 
 PROMPT_ACTION_MISMATCH_ISSUE_TYPE = "tagging_prompt_behavior"
 PROMPT_ACTION_MISMATCH_REASON = "prompt_action_mismatch"
@@ -45,7 +55,9 @@ def _emit(progress_callback: Callable[[dict], None] | None, **payload) -> None:
 
 
 def _episode_task(meta, episode_index: int) -> str:
-    episode = getattr(meta, "episodes", {}).get(episode_index) or getattr(meta, "episodes", {}).get(str(episode_index))
+    episode = getattr(meta, "episodes", {}).get(episode_index) or getattr(meta, "episodes", {}).get(
+        str(episode_index)
+    )
     tasks = episode.get("tasks", []) if episode else []
     return tasks[0] if tasks else ""
 
@@ -87,7 +99,9 @@ def _write_json(path: Path, payload) -> None:
 
 def _flag_set(path: Path) -> set[int]:
     data = _load_json_any(path)
-    values = data.get("flagged_episodes") if isinstance(data, dict) else data if isinstance(data, list) else []
+    values = (
+        data.get("flagged_episodes") if isinstance(data, dict) else data if isinstance(data, list) else []
+    )
     out = set()
     for value in values or []:
         try:
@@ -276,7 +290,7 @@ def run_tagging(
             close_tagger()
 
     def _tag_episode(episode_index: int, vlm_tagger) -> tuple[dict, list[float] | None, str, str]:
-        table = pq.read_table(root / meta.get_data_file_path(episode_index))
+        table = read_episode_table(root, meta, episode_index)
         tags = {}
         vlm_values = {}
         vlm_error = None
@@ -284,13 +298,17 @@ def run_tagging(
         first_image_pil = None
         if first_frame_vlm_tags and vlm_tagger is not None:
             try:
-                first_image_pil, _ = read_first_frame_image(root, meta, episode_index, image_key=image_key or None)
+                first_image_pil, _ = read_first_frame_image(
+                    root, meta, episode_index, image_key=image_key or None
+                )
                 vlm_values = vlm_tagger.predict_many(first_image_pil, first_frame_vlm_tags)
             except Exception as exc:
                 vlm_error = str(exc)
         elif prompt_action_tag and vlm_tagger is not None:
             try:
-                first_image_pil, _ = read_first_frame_image(root, meta, episode_index, image_key=image_key or None)
+                first_image_pil, _ = read_first_frame_image(
+                    root, meta, episode_index, image_key=image_key or None
+                )
             except Exception:
                 first_image_pil = None
 
@@ -298,7 +316,9 @@ def run_tagging(
         if prompt_action_tag and vlm_tagger is not None:
             try:
                 final_frame_index = max(0, int(table.num_rows) - 1)
-                final_image_pil, _ = read_frame_image(root, meta, episode_index, final_frame_index, image_key=image_key or None)
+                final_image_pil, _ = read_frame_image(
+                    root, meta, episode_index, final_frame_index, image_key=image_key or None
+                )
                 match_detail = vlm_tagger.predict_prompt_action_match(
                     first_image_pil,
                     final_image_pil,
@@ -325,7 +345,9 @@ def run_tagging(
                 tags[name] = arm_from_action(table)
             elif backend == "geometric" and name == "grasp_xy":
                 features = getattr(meta, "features", {})
-                robot_type = getattr(meta, "robot_type", "") or getattr(meta, "info", {}).get("robot_type", "")
+                robot_type = getattr(meta, "robot_type", "") or getattr(meta, "info", {}).get(
+                    "robot_type", ""
+                )
                 details = trajectory_xy_details_from_table(table, features, robot_type=robot_type)
                 tags[name] = grasp_xy_from_trajectory(table, features, robot_type=robot_type)
                 if tags[name] is not None:
@@ -443,7 +465,14 @@ def run_tagging(
                         total=len(selected_episodes),
                         message=f"VLM tagging failed for episode {episode_index}: {record['error_detail']}",
                     )
-                _emit(progress_callback, status="running", step="tagging", current=idx, total=len(selected_episodes), message=f"Tagged episode {episode_index}")
+                _emit(
+                    progress_callback,
+                    status="running",
+                    step="tagging",
+                    current=idx,
+                    total=len(selected_episodes),
+                    message=f"Tagged episode {episode_index}",
+                )
         finally:
             _close_tagger(vlm_tagger)
     else:
@@ -456,7 +485,9 @@ def run_tagging(
                 return None
             tagger = getattr(worker_state, "tagger", None)
             if tagger is None:
-                tagger = VLMTagger.load(vlm_model, endpoint=vlm_endpoint, backend=vlm_backend, token=vlm_token)
+                tagger = VLMTagger.load(
+                    vlm_model, endpoint=vlm_endpoint, backend=vlm_backend, token=vlm_token
+                )
                 worker_state.tagger = tagger
                 with worker_lock:
                     worker_taggers.append(tagger)
@@ -471,12 +502,10 @@ def run_tagging(
                     executor.submit(_tag_episode_in_worker, episode_index): episode_index
                     for episode_index in selected_episodes
                 }
-                completed = 0
-                for future in as_completed(future_to_episode):
+                for completed, future in enumerate(as_completed(future_to_episode), start=1):
                     episode_index = future_to_episode[future]
                     record, grasp_point, grasp_source, grasp_projection = future.result()
                     record = _store_record(record)
-                    completed += 1
                     if grasp_point is not None:
                         heatmap_points.append(grasp_point)
                         if not grasp_xy_source:
@@ -553,7 +582,14 @@ def run_tagging(
         done_message = f"No missing tags to run ({skipped_existing} existing episodes kept)"
     elif skipped_existing:
         done_message = f"Auto-tagging complete ({skipped_existing} existing episodes kept)"
-    _emit(progress_callback, status="done", step="tagging_done", current=len(selected_episodes), total=len(selected_episodes), message=done_message)
+    _emit(
+        progress_callback,
+        status="done",
+        step="tagging_done",
+        current=len(selected_episodes),
+        total=len(selected_episodes),
+        message=done_message,
+    )
     return TaggingResult(
         root=root,
         repo_id=getattr(meta, "repo_id", f"local/{root.name}"),

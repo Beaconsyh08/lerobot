@@ -12,7 +12,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lerobot.common.datasets.compute_stats import aggregate_stats
-from lerobot.data_platform.precompute.mutations import fix_episode_indices
 from lerobot.common.datasets.utils import (
     EPISODES_PATH,
     EPISODES_STATS_PATH,
@@ -25,6 +24,12 @@ from lerobot.common.datasets.utils import (
     write_jsonlines,
     write_stats,
 )
+from lerobot.data_platform.precompute.dataset_io import (
+    V3DatasetMetadata,
+    is_v3_dataset,
+    load_episode_records,
+)
+from lerobot.data_platform.precompute.mutations import fix_episode_indices
 
 LogCallback = Callable[[str], None] | None
 
@@ -689,9 +694,7 @@ def _delete_episodes_inplace_unprotected(
     if episodes_stats_path.is_file():
         old_stats = load_episodes_stats(root)
         new_stats = {
-            new_idx: old_stats[old_idx]
-            for old_idx, new_idx in old_to_new.items()
-            if old_idx in old_stats
+            new_idx: old_stats[old_idx] for old_idx, new_idx in old_to_new.items() if old_idx in old_stats
         }
         write_jsonlines(
             [
@@ -751,10 +754,17 @@ def delete_episodes_inplace(
         raise ValueError("no episodes selected")
 
     root = Path(dataset.root)
-    all_indices = set(load_episodes(root))
+    source_is_v3 = is_v3_dataset(root)
+    all_indices = (
+        {int(row["episode_index"]) for row in load_episode_records(root)}
+        if source_is_v3
+        else set(load_episodes(root))
+    )
     missing = sorted(delete_set - all_indices)
     if missing:
         raise ValueError(f"episodes not found: {missing}")
+    if len(delete_set) == len(all_indices):
+        raise ValueError("episode deletion would remove the entire dataset")
 
     snapshot = _DeleteRollbackSnapshot(root, static_folder)
     dataset_state = _dataset_delete_state(dataset)
@@ -762,12 +772,118 @@ def delete_episodes_inplace(
         log("Created rollback snapshot before episode deletion")
 
     try:
-        result = _delete_episodes_inplace_unprotected(
-            dataset,
-            sorted(delete_set),
-            static_folder=static_folder,
-            log=log,
-        )
+        if source_is_v3:
+            from lerobot.data_platform.precompute.preprocess.dataset_merge import run_merge
+
+            remaining_old_indices = sorted(all_indices - delete_set)
+            old_to_new = {old_index: new_index for new_index, old_index in enumerate(remaining_old_indices)}
+            with tempfile.TemporaryDirectory(
+                prefix=f".{root.name}.delete-v3-",
+                dir=root.parent,
+            ) as temp_dir:
+                rebuilt_root = Path(temp_dir) / "dataset"
+                run_merge(
+                    [root],
+                    out_root=rebuilt_root,
+                    workers=8,
+                    exclude_episodes=[delete_set],
+                    _allow_single_source=True,
+                    _op="delete_episodes",
+                    _default_op="delete_episodes",
+                )
+
+                generated_meta = rebuilt_root / "meta"
+                for child in (root / "meta").iterdir():
+                    if child.name in {
+                        "episodes",
+                        "episodes.jsonl",
+                        "episodes_stats.jsonl",
+                        "info.json",
+                        "stats.json",
+                        "tasks.jsonl",
+                        "tasks.parquet",
+                    }:
+                        continue
+                    destination = generated_meta / child.name
+                    if destination.exists():
+                        continue
+                    if child.is_dir():
+                        shutil.copytree(child, destination, symlinks=True)
+                    else:
+                        shutil.copy2(child, destination, follow_symlinks=False)
+
+                for name in ("data", "meta", "videos"):
+                    target = root / name
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    source = rebuilt_root / name
+                    if source.exists():
+                        shutil.move(str(source), target)
+
+            image_keys = _feature_keys(dataset, "image")
+            video_keys = (
+                list(dataset.meta.video_keys)
+                if hasattr(dataset.meta, "video_keys")
+                else _feature_keys(dataset, "video")
+            )
+            for episode_index in sorted(delete_set):
+                _delete_cached_files(
+                    static_folder,
+                    image_keys,
+                    video_keys,
+                    episode_index,
+                )
+            for old_index, new_index in old_to_new.items():
+                if old_index != new_index:
+                    _reindex_cached_files(
+                        static_folder,
+                        image_keys,
+                        video_keys,
+                        old_index,
+                        new_index,
+                    )
+            construction_plan_path = root / "meta" / "construction_plan.json"
+            if construction_plan_path.is_file():
+                _reindex_construction_plan(
+                    construction_plan_path,
+                    delete_set,
+                    old_to_new,
+                )
+            reindex_static_after_episode_delete(
+                static_folder,
+                delete_set,
+                old_to_new,
+                raise_on_error=True,
+                log=log,
+            )
+            new_meta = V3DatasetMetadata(
+                getattr(dataset, "repo_id", f"local/{root.name}"),
+                root,
+            )
+            dataset.meta = new_meta
+            dataset.features = new_meta.features
+            dataset.fps = new_meta.fps
+            dataset.codebase_version = new_meta.info.get(
+                "codebase_version",
+                "v3.0",
+            )
+            dataset.total_episodes = new_meta.total_episodes
+            dataset.total_frames = new_meta.total_frames
+            result = {
+                "deleted_episode_ids": sorted(delete_set),
+                "new_total_episodes": new_meta.total_episodes,
+                "next_episode": min(
+                    min(delete_set),
+                    new_meta.total_episodes - 1,
+                ),
+            }
+        else:
+            result = _delete_episodes_inplace_unprotected(
+                dataset,
+                sorted(delete_set),
+                static_folder=static_folder,
+                log=log,
+            )
     except Exception as exc:
         logging.exception("Episode deletion failed; restoring rollback snapshot")
         try:

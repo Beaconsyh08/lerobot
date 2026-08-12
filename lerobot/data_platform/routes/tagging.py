@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import quote
 
@@ -11,25 +12,36 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from flask import abort, jsonify, redirect, render_template, request, send_file
 
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
 from lerobot.data_platform.precompute.labeling import sample_episodes_by_task_type
 from lerobot.data_platform.precompute.tagging import (
     DEFAULT_SELECTED_TAG_NAMES,
     DEFAULT_VLM_BACKEND,
     DEFAULT_VLM_MODEL,
-    available_tag_variants,
-    get_capabilities as get_tagging_capabilities,
-    get_schema as get_tagging_schema,
-    load_episode_record as load_tagging_episode_record,
     load_tags_jsonl,
     merge_tags_to_metadata,
     remove_reviewed_tag,
-    resolved_reviewed_path as tagging_resolved_reviewed_path,
-    resolved_tags_path as tagging_resolved_tags_path,
-    reviewed_path as tagging_reviewed_path,
     run_tagging,
     save_reviewed_tag,
-    source_path as tagging_source_path,
     tags_path,
+)
+from lerobot.data_platform.precompute.tagging import (
+    get_capabilities as get_tagging_capabilities,
+)
+from lerobot.data_platform.precompute.tagging import (
+    get_schema as get_tagging_schema,
+)
+from lerobot.data_platform.precompute.tagging import (
+    load_episode_record as load_tagging_episode_record,
+)
+from lerobot.data_platform.precompute.tagging import (
+    resolved_reviewed_path as tagging_resolved_reviewed_path,
+)
+from lerobot.data_platform.precompute.tagging import (
+    resolved_tags_path as tagging_resolved_tags_path,
+)
+from lerobot.data_platform.precompute.tagging import (
+    source_path as tagging_source_path,
 )
 from lerobot.data_platform.precompute.tagging.geometric_backend import trajectory_xy_details_from_table
 from lerobot.data_platform.routes.context import RouteContext
@@ -48,10 +60,10 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             elif ctx.static_dir_for_key is not None:
                 ds_static = ctx.static_dir_for_key(dataset_key)
                 if ds_static is None:
-                    raise KeyError(ctx.repo_id_from_key(dataset_key))
+                    raise KeyError(ctx.repo_id_from_key(dataset_key)) from None
                 ds_static = Path(ds_static).expanduser()
             else:
-                raise KeyError(ctx.repo_id_from_key(dataset_key))
+                raise KeyError(ctx.repo_id_from_key(dataset_key)) from None
             if not ds_static.exists():
                 raise
             return None, ds_static, True
@@ -61,12 +73,10 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         if not source_file.is_file():
             source_file = tagging_source_path(ds_static / "tagging")
         if source_file.is_file():
-            try:
+            with suppress(Exception):
                 value = json.loads(source_file.read_text()).get("image_key")
                 if value:
                     return str(value)
-            except Exception:
-                pass
         videos_dir = Path(ds_static) / "videos"
         if videos_dir.is_dir():
             image_dirs = sorted(path.name for path in videos_dir.iterdir() if path.is_dir())
@@ -121,7 +131,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         output_variant = None
         tag_defs = get_tagging_schema()
         selected_tag_set = set(selected_tags or [tag["name"] for tag in tag_defs])
-        selected_vlm_tags = [tag for tag in tag_defs if tag.get("backend") == "vlm" and tag["name"] in selected_tag_set]
+        selected_vlm_tags = [
+            tag for tag in tag_defs if tag.get("backend") == "vlm" and tag["name"] in selected_tag_set
+        ]
         if trial:
             sample_result = sample_episodes_by_task_type(
                 dataset_obj.root,
@@ -137,7 +149,11 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         tagging_dir = ds_static / "tagging"
         tagging_dir.mkdir(parents=True, exist_ok=True)
         tags_path(tagging_dir, output_variant).touch(exist_ok=True)
-        candidate_episodes = selected_episodes if selected_episodes is not None else ctx.dataset_episode_ids(dataset_obj, dataset_key)
+        candidate_episodes = (
+            selected_episodes
+            if selected_episodes is not None
+            else ctx.dataset_episode_ids(dataset_obj, dataset_key)
+        )
         existing_records = load_tags_jsonl(tags_path(tagging_dir, output_variant))
 
         def _has_selected_tags(record: dict | None) -> bool:
@@ -157,7 +173,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         )
         vlm_capabilities = get_tagging_capabilities(vlm_model, backend=vlm_backend)
         if selected_vlm_tags and missing_episodes and not vlm_capabilities.get("available"):
-            return jsonify({"error": vlm_capabilities.get("error") or "Selected VLM backend is unavailable."}), 400
+            return jsonify(
+                {"error": vlm_capabilities.get("error") or "Selected VLM backend is unavailable."}
+            ), 400
         if (
             selected_vlm_tags
             and missing_episodes
@@ -166,7 +184,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             and not vlm_capabilities.get("token_configured")
         ):
             token_env = (vlm_capabilities.get("token_env_vars") or ["DASHSCOPE_API_KEY"])[0]
-            return jsonify({"error": f"{vlm_backend} requires a token. Set {token_env} or paste it in the token field."}), 400
+            return jsonify(
+                {"error": f"{vlm_backend} requires a token. Set {token_env} or paste it in the token field."}
+            ), 400
         ctx.invalidate_tagging_status(dataset_key, ds_static)
         total = len(missing_episodes)
         job_id = uuid.uuid4().hex[:12]
@@ -180,9 +200,7 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             "current": 0,
             "total": total,
             "message": (
-                f"Queued trial auto-tagging ({total} episodes, seed={trial_seed})"
-                if trial
-                else "Queued"
+                f"Queued trial auto-tagging ({total} episodes, seed={trial_seed})" if trial else "Queued"
             ),
             "error": None,
             "review_url": f"/{repo_id}/tagging" + (f"?variant={output_variant}" if output_variant else ""),
@@ -238,7 +256,8 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
                     "Trial auto-tagging complete" if output_variant else "Auto-tagging complete",
                     current=len(result.episodes),
                     total=len(result.episodes),
-                    review_url=f"/{result.repo_id}/tagging" + (f"?variant={output_variant}" if output_variant else ""),
+                    review_url=f"/{result.repo_id}/tagging"
+                    + (f"?variant={output_variant}" if output_variant else ""),
                 )
             except Exception as exc:
                 logging.exception("Auto-tagging job failed")
@@ -261,7 +280,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         else:
             records = load_tags_jsonl(tagging_resolved_tags_path(ds_static / "tagging", active_variant))
             if not records:
-                records = load_tags_jsonl(tagging_resolved_reviewed_path(ds_static / "tagging", active_variant))
+                records = load_tags_jsonl(
+                    tagging_resolved_reviewed_path(ds_static / "tagging", active_variant)
+                )
             episode_ids = sorted(records)
             image_key = _tagging_image_key(ds_static, active_variant)
         first_episode = episode_ids[0] if episode_ids else 0
@@ -273,7 +294,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             image_key=image_key,
             cache_only=cache_only,
             viewer_url=f"/{repo_id}/episode_{first_episode}",
-            **ctx.dataset_nav(repo_id, first_episode, "tagging", dataset_obj, ds_static, cache_only=cache_only),
+            **ctx.dataset_nav(
+                repo_id, first_episode, "tagging", dataset_obj, ds_static, cache_only=cache_only
+            ),
         )
 
     @app.route("/api/tagging/<string:dataset_namespace>/<string:dataset_name>/episodes")
@@ -340,7 +363,16 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
         try:
             parquet_path = dataset_obj.root / dataset_obj.meta.get_data_file_path(episode_index)
             trajectory_columns = _trajectory_parquet_columns(parquet_path)
-            table = pq.read_table(parquet_path, columns=trajectory_columns) if trajectory_columns else pa.table({})
+            table = (
+                read_episode_table(
+                    dataset_obj.root,
+                    dataset_obj.meta,
+                    episode_index,
+                    columns=trajectory_columns,
+                )
+                if trajectory_columns
+                else pa.table({})
+            )
             details = trajectory_xy_details_from_table(
                 table,
                 getattr(dataset_obj.meta, "features", {}),
@@ -368,20 +400,32 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             record["trajectory_bounds"] = None
         return jsonify(record)
 
-    @app.route("/api/tagging/<string:dataset_namespace>/<string:dataset_name>/save/<int:episode_index>", methods=["POST"])
+    @app.route(
+        "/api/tagging/<string:dataset_namespace>/<string:dataset_name>/save/<int:episode_index>",
+        methods=["POST"],
+    )
     def api_tagging_save(dataset_namespace, dataset_name, episode_index):
         _, ds_static, _ = _static_context(dataset_namespace, dataset_name)
         body = request.get_json(force=True)
-        variant = ctx.active_tag_variant(ds_static / "tagging", request.args.get("variant") or body.get("variant"))
-        record = save_reviewed_tag(ds_static / "tagging", episode_index, body.get("tags") or {}, manual=True, variant=variant)
+        variant = ctx.active_tag_variant(
+            ds_static / "tagging", request.args.get("variant") or body.get("variant")
+        )
+        record = save_reviewed_tag(
+            ds_static / "tagging", episode_index, body.get("tags") or {}, manual=True, variant=variant
+        )
         ctx.invalidate_tagging_status((dataset_namespace, dataset_name), ds_static)
         return jsonify({"record": record})
 
-    @app.route("/api/tagging/<string:dataset_namespace>/<string:dataset_name>/reset/<int:episode_index>", methods=["POST"])
+    @app.route(
+        "/api/tagging/<string:dataset_namespace>/<string:dataset_name>/reset/<int:episode_index>",
+        methods=["POST"],
+    )
     def api_tagging_reset(dataset_namespace, dataset_name, episode_index):
         _, ds_static, _ = _static_context(dataset_namespace, dataset_name)
         body = request.get_json(silent=True) or {}
-        variant = ctx.active_tag_variant(ds_static / "tagging", request.args.get("variant") or body.get("variant"))
+        variant = ctx.active_tag_variant(
+            ds_static / "tagging", request.args.get("variant") or body.get("variant")
+        )
         remove_reviewed_tag(ds_static / "tagging", episode_index, variant=variant)
         ctx.invalidate_tagging_status((dataset_namespace, dataset_name), ds_static)
         return jsonify({"ok": True})

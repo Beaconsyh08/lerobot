@@ -7,10 +7,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lerobot.data_platform.precompute.annotation import QUALITY_FLAG_TYPE, compute_quality_flags, series_to_2d
+from lerobot.data_platform.precompute.dataset_io import (
+    V3DatasetMetadata,
+    is_v3_dataset,
+    load_episode_records,
+    load_task_records,
+    read_episode_table,
+    replace_episode_column,
+    write_episode_records,
+    write_task_records,
+)
 from lerobot.data_platform.precompute.labeling.task_parser import normalize_object_name, parse_task
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
@@ -18,9 +27,7 @@ from lerobot.data_platform.precompute.preprocess.common import (
     emit,
     format_data_path,
     load_json,
-    load_jsonl,
     validate_dataset_root,
-    write_jsonl,
 )
 from lerobot.data_platform.precompute.tagging.review import current_tags, latest_tag_variant
 from lerobot.data_platform.precompute.timeseries import (
@@ -46,6 +53,14 @@ FREEFORM_TASK_ASSIGNMENT_REASONS = {PROMPT_ACTION_MISMATCH_REASON, MANUAL_PROMPT
 # The platform's prompt convention permits one instruction without commas or periods.
 # Any occurrence of either character is reported as ``multi_sentence_prompt``.
 PROMPT_SENTENCE_PUNCTUATION = (",", ".")
+
+
+class _LegacyMetadataPath:
+    def __init__(self, info: dict):
+        self.info = info
+
+    def get_data_file_path(self, episode_index: int) -> Path:
+        return format_data_path(self.info, episode_index)
 
 
 def _load_json_any(path: Path):
@@ -110,11 +125,8 @@ def _array_from_column(table, column_name: str, fallback_dim: int) -> np.ndarray
 
 
 def _tasks_by_index(root: Path) -> dict[int, str]:
-    tasks_path = Path(root) / "meta" / "tasks.jsonl"
-    if not tasks_path.is_file():
-        return {}
     tasks: dict[int, str] = {}
-    for row in load_jsonl(tasks_path):
+    for row in load_task_records(root):
         try:
             task_index = int(row["task_index"])
         except (KeyError, TypeError, ValueError):
@@ -126,8 +138,7 @@ def _tasks_by_index(root: Path) -> dict[int, str]:
 
 
 def _task_rows(root: Path) -> list[dict]:
-    tasks_path = Path(root) / "meta" / "tasks.jsonl"
-    return load_jsonl(tasks_path) if tasks_path.is_file() else []
+    return load_task_records(root)
 
 
 def _task_index_for_prompt(root: Path, prompt: str) -> int:
@@ -145,7 +156,7 @@ def _task_index_for_prompt(root: Path, prompt: str) -> int:
 
     task_index = (max(used_indices) + 1) if used_indices else 0
     rows.append({"task_index": task_index, "task": prompt})
-    write_jsonl(Path(root) / "meta" / "tasks.jsonl", rows)
+    write_task_records(root, rows)
     return task_index
 
 
@@ -226,17 +237,16 @@ def _prompt_with_target(template_prompt: str, target: str) -> str:
         return f"Give me the {target}"
     if parsed.get("reference"):
         reference = str(parsed.get("reference") or "").strip().lower()
-        return f"Pick up the {target} to the {parsed.get('direction') or 'left'} of the {reference or 'object'}"
+        return (
+            f"Pick up the {target} to the {parsed.get('direction') or 'left'} of the {reference or 'object'}"
+        )
     if parsed.get("direction"):
         return f"Pick up the {target} on the {parsed.get('direction') or 'left'}"
     return f"Pick up the {target}"
 
 
 def _episode_rows_by_index(root: Path) -> dict[int, dict]:
-    episodes_path = Path(root) / "meta" / "episodes.jsonl"
-    if not episodes_path.is_file():
-        return {}
-    return _records_by_episode(load_jsonl(episodes_path))
+    return _records_by_episode(load_episode_records(root))
 
 
 def _task_object_vocab(root: Path) -> set[str]:
@@ -295,8 +305,8 @@ def _task_assignment_candidates_for_issue(root: Path, issue: dict) -> list[str]:
     seen: set[str] = set()
     is_freeform_repair = issue.get("reason") in FREEFORM_TASK_ASSIGNMENT_REASONS
     target_vocab = _task_target_vocab(root) if is_freeform_repair else []
-    object_vocab = set(target_vocab) if target_vocab else (
-        _task_object_vocab(root) if is_freeform_repair else set()
+    object_vocab = (
+        set(target_vocab) if target_vocab else (_task_object_vocab(root) if is_freeform_repair else set())
     )
     if is_freeform_repair:
         episode = _issue_episode(issue)
@@ -475,9 +485,14 @@ def _scan_episode(
     episode_row: dict,
     data_version: str,
     tasks_by_index: dict[int, str] | None = None,
+    meta: V3DatasetMetadata | None = None,
 ) -> tuple[int, int, list[dict]]:
     episode_index = int(episode_row["episode_index"])
-    parquet_path = root / format_data_path(info, episode_index)
+    parquet_path = (
+        root / meta.get_data_file_path(episode_index)
+        if meta is not None
+        else root / format_data_path(info, episode_index)
+    )
     if not parquet_path.is_file():
         return (
             episode_index,
@@ -504,7 +519,11 @@ def _scan_episode(
         columns.append("subtask_state")
     if "task_index" in schema.names:
         columns.append("task_index")
-    table = pq.read_table(parquet_path, columns=columns)
+    table = (
+        read_episode_table(root, meta, episode_index, columns=columns)
+        if meta is not None
+        else pq.read_table(parquet_path, columns=columns)
+    )
     timestamps = np.asarray(table["timestamp"].to_pylist(), dtype=np.float64)
 
     features = info.get("features") or {}
@@ -535,7 +554,9 @@ def _annotation_issues(static_dir: Path) -> list[dict]:
 
 def _refresh_quality_flag_files(static_dir: Path, quality_issues: list[dict]) -> set[int]:
     static_dir = Path(static_dir)
-    quality_episodes = {episode for episode in (_issue_episode(issue) for issue in quality_issues) if episode is not None}
+    quality_episodes = {
+        episode for episode in (_issue_episode(issue) for issue in quality_issues) if episode is not None
+    }
     previous_auto = _flag_set(static_dir / QUALITY_FLAGGED_EPISODES)
     existing_flagged = _flag_set(static_dir / "flagged_episodes.json")
     manual_flagged = existing_flagged - previous_auto
@@ -676,11 +697,7 @@ def _remove_episode_from_manual_task_assignment_flag(static_dir: Path, episode_i
         reasons[key] = retained
     else:
         reasons.pop(key, None)
-    flagged = sorted(
-        ep
-        for ep in _flag_set(path)
-        if ep != int(episode_index) or retained
-    )
+    flagged = sorted(ep for ep in _flag_set(path) if ep != int(episode_index) or retained)
     payload["flagged_episodes"] = flagged
     payload["flag_reasons"] = reasons
     _write_json(path, payload)
@@ -732,8 +749,7 @@ def apply_task_assignment_choice(
     if record.get("reason") not in FREEFORM_TASK_ASSIGNMENT_REASONS and selected_task not in candidates:
         raise ValueError(f"selected task is not one of the flagged candidates for episode {episode_index}")
 
-    episodes_path = root / "meta" / "episodes.jsonl"
-    episodes = load_jsonl(episodes_path)
+    episodes = load_episode_records(root)
     found_episode = False
     for row in episodes:
         try:
@@ -745,22 +761,31 @@ def apply_task_assignment_choice(
             found_episode = True
             break
     if not found_episode:
-        raise ValueError(f"episode {episode_index} not found in episodes.jsonl")
-    write_jsonl(episodes_path, episodes)
+        raise ValueError(f"episode {episode_index} not found in dataset metadata")
+    write_episode_records(root, episodes)
 
     info = load_json(root / "meta" / "info.json")
-    parquet_path = root / format_data_path(info, episode_index)
+    meta = V3DatasetMetadata(f"local/{root.name}", root) if is_v3_dataset(root) else None
+    parquet_path = (
+        root / meta.get_data_file_path(episode_index)
+        if meta is not None
+        else root / format_data_path(info, episode_index)
+    )
     task_index_written = None
     if parquet_path.is_file() and "task_index" in pq.read_schema(parquet_path).names:
         task_index_written = _task_index_for_prompt(root, selected_task)
-        table = pq.read_table(parquet_path)
-        idx = table.column_names.index("task_index")
-        field = table.schema.field("task_index")
-        task_values = pa.array([int(task_index_written)] * table.num_rows, type=field.type)
-        table = table.set_column(idx, field, task_values)
-        tmp_path = parquet_path.with_suffix(".parquet.tmp")
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(parquet_path)
+        if meta is not None:
+            episode_table = read_episode_table(root, meta, episode_index, columns=["task_index"])
+            row_count = episode_table.num_rows
+        else:
+            row_count = pq.read_metadata(parquet_path).num_rows
+        replace_episode_column(
+            root,
+            meta or _LegacyMetadataPath(info),
+            episode_index,
+            "task_index",
+            [int(task_index_written)] * row_count,
+        )
 
     issues_path = static_dir / "annotation_issues.json"
     issues = _annotation_issues(static_dir)
@@ -907,7 +932,9 @@ def _sync_prompt_action_mismatch_from_tagging(
         if int(episode) in scanned_episodes
         if (issue := _prompt_action_mismatch_issue_from_tag(record, variant=variant)) is not None
     ]
-    mismatch_episodes = {episode for episode in (_issue_episode(issue) for issue in mismatch_issues) if episode is not None}
+    mismatch_episodes = {
+        episode for episode in (_issue_episode(issue) for issue in mismatch_issues) if episode is not None
+    }
 
     issues_path = static_dir / "annotation_issues.json"
     existing = _load_json_any(issues_path)
@@ -1018,14 +1045,17 @@ def run_quality_flag_detection(
     root = validate_dataset_root(Path(root))
     static_dir = Path(static_dir).expanduser()
     info = load_json(root / "meta" / "info.json")
-    selected_data_version = str(data_version or infer_data_version_from_features(info.get("features") or {})).upper()
+    selected_data_version = str(
+        data_version or infer_data_version_from_features(info.get("features") or {})
+    ).upper()
     if selected_data_version not in {DATA_VERSION_DVT1, DATA_VERSION_DVT2}:
         raise ValueError(f"Unsupported data_version: {selected_data_version}")
 
-    episode_rows = load_jsonl(root / "meta" / "episodes.jsonl")
+    episode_rows = load_episode_records(root)
     by_episode = _records_by_episode(episode_rows)
     task_lookup = _tasks_by_index(root)
-    selected_ids = sorted(set(int(episode) for episode in episodes)) if episodes else sorted(by_episode)
+    meta = V3DatasetMetadata(f"local/{root.name}", root) if is_v3_dataset(root) else None
+    selected_ids = sorted({int(episode) for episode in episodes}) if episodes else sorted(by_episode)
     missing = [episode for episode in selected_ids if episode not in by_episode]
     if missing:
         raise ValueError(f"episodes not found: {missing}")
@@ -1045,7 +1075,14 @@ def run_quality_flag_detection(
     worker_count = max(1, int(workers or 1))
     if worker_count == 1 or total <= 1:
         for idx, row in enumerate(selected_rows, start=1):
-            episode_index, frame_count, issues = _scan_episode(root, info, row, selected_data_version, task_lookup)
+            episode_index, frame_count, issues = _scan_episode(
+                root,
+                info,
+                row,
+                selected_data_version,
+                task_lookup,
+                meta,
+            )
             total_frames += frame_count
             quality_issues.extend(issues)
             emit(
@@ -1059,7 +1096,15 @@ def run_quality_flag_detection(
     else:
         with ThreadPoolExecutor(max_workers=min(worker_count, total)) as executor:
             futures = {
-                executor.submit(_scan_episode, root, info, row, selected_data_version, task_lookup): int(row["episode_index"])
+                executor.submit(
+                    _scan_episode,
+                    root,
+                    info,
+                    row,
+                    selected_data_version,
+                    task_lookup,
+                    meta,
+                ): int(row["episode_index"])
                 for row in selected_rows
             }
             for idx, future in enumerate(as_completed(futures), start=1):
@@ -1113,7 +1158,13 @@ def run_quality_flag_detection(
         ]
     )
 
-    emit(progress_callback, status="done", current=total, total=total, message="Quality flag detection complete")
+    emit(
+        progress_callback,
+        status="done",
+        current=total,
+        total=total,
+        message="Quality flag detection complete",
+    )
     return PreprocessResult(
         op="quality_flags",
         src_roots=[root],

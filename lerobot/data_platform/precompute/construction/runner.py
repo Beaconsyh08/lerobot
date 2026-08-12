@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,7 +12,13 @@ from lerobot.data_platform.precompute.construction.selector import select_source
 from lerobot.data_platform.precompute.construction.types import ConstructionPlan
 from lerobot.data_platform.precompute.construction.vocab import build_vocab
 from lerobot.data_platform.precompute.construction.writer import write_synthetic_dataset
+from lerobot.data_platform.precompute.dataset_io import V3DatasetMetadata, is_v3_dataset
 from lerobot.data_platform.precompute.labeling.review import labels_path, load_labels_jsonl, reviewed_path
+from lerobot.data_platform.precompute.preprocess.dataset_version import (
+    DEFAULT_V3_CONVERT_WORKERS,
+    materialize_v21_from_v3,
+    run_convert_v3,
+)
 from lerobot.data_platform.precompute.tagging.review import current_tags
 
 
@@ -104,7 +111,14 @@ def run_construction(
     oversample_factor = float(_config_value(config, "oversample_factor", 1.0))
     allow_pick_to_give = bool(_config_value(config, "allow_pick_to_give", False))
 
-    _emit(progress_callback, status="running", step="construction_preview", current=0, total=1, message="Building construction preview")
+    _emit(
+        progress_callback,
+        status="running",
+        step="construction_preview",
+        current=0,
+        total=1,
+        message="Building construction preview",
+    )
     vocab = build_vocab(meta)
     labels = load_current_labels(labeling_dir)
     tags = load_current_tags_for_construction(labeling_dir)
@@ -137,17 +151,57 @@ def run_construction(
         message=f"Selected {len(plans)} constructed negatives",
     )
 
-    write_result = write_synthetic_dataset(
-        src_root,
-        plans,
-        out_root,
-        include_positives,
-        progress_callback=progress_callback,
-        source_repo_id=getattr(meta, "repo_id", f"local/{src_root.name}"),
-    )
+    source_repo_id = getattr(meta, "repo_id", f"local/{src_root.name}")
+    if is_v3_dataset(src_root):
+        with tempfile.TemporaryDirectory(
+            prefix=".lerobot-v3-construction-",
+            dir=out_root.parent,
+        ) as temp_dir:
+            temp_root = Path(temp_dir)
+            legacy_source = materialize_v21_from_v3(
+                src_root,
+                temp_root / "source",
+                workers=DEFAULT_V3_CONVERT_WORKERS,
+                progress_callback=progress_callback,
+            )
+            legacy_output = temp_root / "output"
+            write_result = write_synthetic_dataset(
+                legacy_source,
+                plans,
+                legacy_output,
+                include_positives,
+                progress_callback=progress_callback,
+                source_repo_id=source_repo_id,
+            )
+            run_convert_v3(
+                legacy_output,
+                out_root,
+                workers=DEFAULT_V3_CONVERT_WORKERS,
+                progress_callback=progress_callback,
+            )
+        plan_path = out_root / "meta" / "construction_plan.json"
+        if plan_path.is_file():
+            plan_doc = json.loads(plan_path.read_text())
+            plan_doc["source_root"] = str(src_root)
+            plan_doc["source_repo_id"] = source_repo_id
+            plan_doc["source_format"] = "v3.0"
+            plan_path.write_text(json.dumps(plan_doc, indent=2, ensure_ascii=False) + "\n")
+        write_result = {**write_result, "out_root": out_root}
+    else:
+        write_result = write_synthetic_dataset(
+            src_root,
+            plans,
+            out_root,
+            include_positives,
+            progress_callback=progress_callback,
+            source_repo_id=source_repo_id,
+        )
 
     # Load the result through LeRobot metadata validation before registering it in the web app.
-    LeRobotDatasetMetadata(repo_id=f"local/{out_root.name}", root=out_root)
+    if is_v3_dataset(out_root):
+        V3DatasetMetadata(repo_id=f"local/{out_root.name}", root=out_root)
+    else:
+        LeRobotDatasetMetadata(repo_id=f"local/{out_root.name}", root=out_root)
 
     _emit(
         progress_callback,

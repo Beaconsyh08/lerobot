@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
+
 
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.is_file():
@@ -21,9 +23,11 @@ def _read_jsonl(path: Path) -> list[dict]:
 def metadata_stats(root: Path, meta) -> dict:
     root = Path(root)
     info = json.loads((root / "meta" / "info.json").read_text())
-    tasks = _read_jsonl(root / "meta" / "tasks.jsonl")
-    episodes = _read_jsonl(root / "meta" / "episodes.jsonl")
-    image_keys = [key for key, ft in info.get("features", {}).items() if ft.get("dtype") == "image"]
+    tasks = getattr(meta, "tasks", {}) or _read_jsonl(root / "meta" / "tasks.jsonl")
+    episodes = getattr(meta, "episodes", {}) or _read_jsonl(root / "meta" / "episodes.jsonl")
+    image_keys = [
+        key for key, ft in info.get("features", {}).items() if ft.get("dtype") in {"image", "video"}
+    ]
     action_feature = info.get("features", {}).get("action", {})
     return {
         "root": str(root),
@@ -40,7 +44,11 @@ def action_stats(root: Path, meta, max_episodes: int = 64) -> dict:
     values = []
     for episode_index in sorted(getattr(meta, "episodes", {}).keys())[:max_episodes]:
         path = Path(root) / meta.get_data_file_path(episode_index)
-        table = pq.read_table(path, columns=["action"]) if "action" in pq.read_schema(path).names else None
+        table = (
+            read_episode_table(root, meta, episode_index, columns=["action"])
+            if "action" in pq.read_schema(path).names
+            else None
+        )
         if table is None:
             continue
         for value in table["action"].to_pylist():
@@ -60,4 +68,3 @@ def action_stats(root: Path, meta, max_episodes: int = 64) -> dict:
         "min": np.min(arr, axis=0).round(6).tolist(),
         "max": np.max(arr, axis=0).round(6).tolist(),
     }
-

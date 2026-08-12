@@ -4,8 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from lerobot.data_platform.precompute.dataset_io import update_episode_metadata
 from lerobot.data_platform.precompute.tagging.schema import normalize_tag_values
-
 
 _VARIANT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
@@ -199,7 +199,9 @@ def save_reviewed_tag(
     originals = load_tags_jsonl(resolved_tags_path(tagging_dir, variant))
     original = originals.get(int(episode_index), {"episode_index": int(episode_index), "tags": {}})
     reviewed = load_tags_jsonl(resolved_reviewed_path(tagging_dir, variant))
-    record = merge_tag_record(original, {"episode_index": int(episode_index), "tags": normalize_tag_values(tags)})
+    record = merge_tag_record(
+        original, {"episode_index": int(episode_index), "tags": normalize_tag_values(tags)}
+    )
     record["manual"] = bool(manual)
     record["reviewed"] = True
     reviewed[int(episode_index)] = record
@@ -230,7 +232,11 @@ def load_episode_record(tagging_dir: Path, episode_index: int, variant: str | No
     if original is None:
         return None
     reviewed = load_tags_jsonl(resolved_reviewed_path(tagging_dir, variant))
-    current = merge_tag_record(original, reviewed.get(int(episode_index))) if int(episode_index) in reviewed else original
+    current = (
+        merge_tag_record(original, reviewed.get(int(episode_index)))
+        if int(episode_index) in reviewed
+        else original
+    )
     return {"original": original, "current": current, "reviewed": int(episode_index) in reviewed}
 
 
@@ -240,21 +246,16 @@ def merge_tags_to_metadata(root: Path, tagging_dir: Path, variant: str | None = 
     records = current_tags(tagging_dir, variant)
     if not records:
         raise FileNotFoundError(f"Tags not found: {resolved_tags_path(tagging_dir, variant)}")
-    episodes_path = root / "meta" / "episodes.jsonl"
-    rows = []
-    with episodes_path.open() as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    merged = 0
-    merged_episodes = []
-    for row in rows:
-        episode_index = int(row["episode_index"])
-        record = records.get(episode_index)
-        if record is None:
-            continue
-        row["tags"] = dict(record.get("tags") or {})
-        merged += 1
-        merged_episodes.append(episode_index)
-    _write_jsonl_atomic(episodes_path, rows)
-    return {"merged": merged, "episodes": merged_episodes, "episodes_path": str(episodes_path)}
+    updates = {
+        int(episode_index): {"tags": dict(record.get("tags") or {})}
+        for episode_index, record in records.items()
+    }
+    merged_episodes = update_episode_metadata(root, updates)
+    episodes_path = (
+        root / "meta" / ("episodes" if (root / "meta" / "episodes").is_dir() else "episodes.jsonl")
+    )
+    return {
+        "merged": len(merged_episodes),
+        "episodes": merged_episodes,
+        "episodes_path": str(episodes_path),
+    }

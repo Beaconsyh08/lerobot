@@ -245,6 +245,8 @@
                                             <span class="rounded px-2 py-0.5 text-[11px]"
                                                   :class="dataVersionClass(dataset)"
                                                   x-text="dataVersionText(dataset)"></span>
+                                            <span class="rounded border border-emerald-800 bg-emerald-950 px-2 py-0.5 text-[11px] text-emerald-300"
+                                                  x-show="datasetIsV3(dataset)">v3.0</span>
                                             <span class="rounded border border-cyan-800 bg-cyan-950 px-2 py-0.5 text-[11px] text-cyan-300"
                                                   x-show="dataset.cache_only">cache-only</span>
                                         </div>
@@ -287,6 +289,8 @@
                                             <span class="rounded px-2 py-0.5 text-[11px]"
                                                   :class="dataVersionClass(candidate)"
                                                   x-text="dataVersionText(candidate)"></span>
+                                            <span class="rounded border border-emerald-800 bg-emerald-950 px-2 py-0.5 text-[11px] text-emerald-300"
+                                                  x-show="datasetIsV3(candidate)">v3.0</span>
                                             <span class="rounded border border-cyan-800 bg-cyan-950 px-2 py-0.5 text-[11px] text-cyan-300"
                                                   x-show="candidate.cache_only">cache-only</span>
                                         </div>
@@ -483,6 +487,14 @@
                                    x-model="options.downsample"
                                    placeholder="1">
                         </label>
+                        <label class="block">
+                            <span class="mb-1 block text-xs text-slate-400">fallback stage count</span>
+                            <input type="number"
+                                   min="2"
+                                   class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                   x-model.number="options.fallback_stage_count">
+                            <span class="mt-1 block text-[11px] text-slate-500">Tasks without pick/place/give rules are split into this many equal-duration stages.</span>
+                        </label>
                     </div>
 
                     <div class="rounded-lg border border-red-900/70 bg-red-950/20">
@@ -633,6 +645,22 @@
                             <span>Convert action/state dim</span>
                         </label>
                         <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                               x-show="activeTab === 'transform' && consoleMode !== 'visualize' && !selectedDatasetIsV3()"
+                               :class="preprocess.schema_op === 'convert_v3' ? 'border-sky-700 bg-sky-950/30 text-sky-100' : 'text-slate-300'">
+                            <input type="radio" value="convert_v3" x-model="preprocess.schema_op">
+                            <span>Convert dataset to v3.0</span>
+                        </label>
+                        <div class="rounded border border-emerald-800 bg-emerald-950/30 px-3 py-2 text-emerald-200"
+                             x-show="activeTab === 'transform' && consoleMode !== 'visualize' && selectedDatasetIsV3()">
+                            Dataset is already v3.0; no conversion is needed.
+                        </div>
+                        <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                               x-show="activeTab === 'transform' && consoleMode !== 'visualize' && selectedDatasetIsV3()"
+                               :class="preprocess.schema_op === 'repair_v3_video_timestamps' ? 'border-sky-700 bg-sky-950/30 text-sky-100' : 'text-slate-300'">
+                            <input type="radio" value="repair_v3_video_timestamps" x-model="preprocess.schema_op">
+                            <span>Repair v3 video timestamps</span>
+                        </label>
+                        <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
                                x-show="activeTab === 'transform' && consoleMode !== 'visualize'"
                                :class="preprocess.schema_op === 'drop_field' ? 'border-sky-700 bg-sky-950/30 text-sky-100' : 'text-slate-300'">
                             <input type="radio" value="drop_field" x-model="preprocess.schema_op">
@@ -683,6 +711,60 @@
                                    x-model="preprocess.schema_out_root"
                                    placeholder="auto: <src>_action16_<timestamp>">
                         </label>
+                    </div>
+
+                    <div class="space-y-3" x-show="preprocess.schema_op === 'convert_v3' && !selectedDatasetIsV3()">
+                        <div class="rounded border border-sky-900/60 bg-sky-950/20 px-3 py-2 text-xs text-sky-200">
+                            Uses LeRobot 0.4.4 as the v3.0 baseline. v2.1 sources create a non-destructive sibling dataset.
+                            Parquet image cameras keep their original resolution and are encoded with the selected MP4 mode.
+                            After conversion, register the reported output root and prepare its viewer cache in this page.
+                        </div>
+                        <label class="block rounded border border-emerald-900/60 bg-emerald-950/20 px-3 py-2">
+                            <span class="mb-1 block text-xs font-medium text-emerald-200">image video encoding</span>
+                            <select class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 outline-none focus:border-emerald-500"
+                                    x-model="preprocess.v3_image_video_mode">
+                                <option value="lerobot_official">LeRobot official — AV1 / YUV420 / CRF 30</option>
+                                <option value="rgb_lossless">RGB lossless — H.264 RGB / CRF 0</option>
+                            </select>
+                            <span class="mt-1 block text-[11px] text-emerald-300/80">
+                                Both modes preserve the source resolution. The official mode is much smaller but lossy;
+                                RGB lossless is pixel-identical to the Parquet image and produces larger files.
+                            </span>
+                        </label>
+                        <div class="grid gap-3 md:grid-cols-4">
+                            <label class="block">
+                                <span class="mb-1 block text-xs text-slate-400">data file limit (MB)</span>
+                                <input type="number" min="1"
+                                       class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                       x-model.number="preprocess.v3_data_file_size_mb">
+                            </label>
+                            <label class="block">
+                                <span class="mb-1 block text-xs text-slate-400">video file limit (MB)</span>
+                                <input type="number" min="1"
+                                       class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                       x-model.number="preprocess.v3_video_file_size_mb">
+                            </label>
+                            <label class="block">
+                                <span class="mb-1 block text-xs text-slate-400">workers</span>
+                                <input type="number" min="1"
+                                       class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                       x-model.number="preprocess.v3_workers">
+                                <span class="mt-1 block text-[11px] text-slate-500">Parallel episode encoders. Default: 8.</span>
+                            </label>
+                            <label class="block">
+                                <span class="mb-1 block text-xs text-slate-400">output root</span>
+                                <input class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                       x-model="preprocess.schema_out_root"
+                                       placeholder="auto: <src>_v3">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="rounded border border-sky-900/60 bg-sky-950/20 px-3 py-3 text-xs text-sky-200"
+                         x-show="preprocess.schema_op === 'repair_v3_video_timestamps' && selectedDatasetIsV3()">
+                        Stream-copy remuxes MP4 shards onto the dataset FPS grid, then rewrites
+                        meta/episodes video from_timestamp/to_timestamp. Encoded frames, Parquet
+                        frame data, action/state, episode indices, and norm stats are unchanged.
                     </div>
 
                     <div class="grid gap-3 md:grid-cols-2" x-show="preprocess.schema_op === 'drop_field'">
@@ -779,7 +861,7 @@
                     <div class="grid gap-3 md:grid-cols-2" x-show="preprocess.schema_op === 'rewrite_prompts'">
                         <div class="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-400 md:col-span-2">
                             <div class="text-slate-300">Rewrite prompt text in-place</div>
-                            <div class="mt-1">Updates meta/tasks.jsonl and meta/episodes.jsonl. Does not change task_index in parquet. Actual runs create a backup under meta/prompt_rewrite_backups/.</div>
+                            <div class="mt-1">Updates v2.1 JSONL metadata or v3 tasks/episodes Parquet metadata. Does not change task_index in parquet. Actual runs create a backup under meta/prompt_rewrite_backups/.</div>
                         </div>
                         <label class="block">
                             <span class="mb-1 block text-xs text-slate-400">regex pattern</span>
@@ -804,7 +886,7 @@
                     <div class="grid gap-3 md:grid-cols-2" x-show="preprocess.schema_op === 'apply_prompt_assignments'">
                         <div class="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-400 md:col-span-2">
                             <div class="text-slate-300">Apply pending prompt repairs</div>
-                            <div class="mt-1">Reads <span class="font-mono text-slate-200">static/prompt_assignments_pending.json</span> and applies cache-only viewer prompt choices to <span class="font-mono text-slate-200">meta/episodes.jsonl</span> and parquet <span class="font-mono text-slate-200">task_index</span>.</div>
+                            <div class="mt-1">Reads <span class="font-mono text-slate-200">static/prompt_assignments_pending.json</span> and applies viewer prompt choices to v2.1/v3 episode metadata plus the selected episode rows in parquet <span class="font-mono text-slate-200">task_index</span>.</div>
                             <div class="mt-1">Successful entries are removed from the pending file. Failed entries stay pending for retry.</div>
                         </div>
                         <label class="block">
@@ -1566,6 +1648,9 @@
                             <div class="h-full bg-sky-500 transition-all" :style="`width: ${activeJob ? activeJob.progress || 0 : 0}%`"></div>
                         </div>
                         <p class="mt-2 text-xs text-slate-400" x-text="activeJob ? activeJob.message : 'No running job.'"></p>
+                        <p class="mt-1 break-all text-[11px] text-sky-300"
+                           x-show="activeJob && activeJob.output_root"
+                           x-text="activeJob ? `output: ${activeJob.output_root}` : ''"></p>
                         <div class="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-500">
                             <span x-text="activeJob ? `${activeJob.current || 0}/${activeJob.total || 0}` : '0/0'"></span>
                             <span x-text="activeJob ? `elapsed ${formatDuration(activeJob.elapsed_seconds)}` : 'elapsed -'"></span>
@@ -1632,9 +1717,15 @@
                             </div>
                         </div>
                     </div>
-                    <p class="text-xs text-slate-500" x-show="selectedDataset && !canOpenViewer()">
+                    <p class="text-xs text-slate-500"
+                       x-show="selectedDataset && !canOpenViewer() && !selectedDatasetIsV3()">
                         Viewer is disabled until metadata is loaded and both video/CSV cache are present for the selected dataset.
                     </p>
+                    <div class="rounded border border-emerald-900/60 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-200"
+                         x-show="selectedDatasetIsV3()">
+                        v3.0 viewer support uses a read-only adapter in this environment. Run Prepare video + CSV once,
+                        then open it with the same embedded viewer. The source dataset is not modified.
+                    </div>
 
                     <div>
                         <div class="mb-2 flex items-center justify-between">
@@ -1654,6 +1745,50 @@
                             <p class="mt-2 whitespace-pre-wrap text-red-300" x-show="activeJob && activeJob.error" x-text="activeJob && activeJob.error"></p>
                         </div>
                     </div>
+
+                    <div>
+                        <div class="mb-2 flex items-center justify-between">
+                            <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-400">Operation history</h3>
+                            <button class="text-xs text-sky-300 hover:text-sky-200" @click="loadOperationLogs()">refresh</button>
+                        </div>
+                        <div class="mb-2 grid grid-cols-[8rem_1fr] gap-2">
+                            <select class="rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-300"
+                                    x-model="operationLogFilter.status" @change="loadOperationLogs()">
+                                <option value="">all status</option>
+                                <option value="success">success</option>
+                                <option value="accepted">accepted</option>
+                                <option value="failed">failed</option>
+                                <option value="started">started</option>
+                            </select>
+                            <input class="rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-300"
+                                   x-model="operationLogFilter.operation" @keydown.enter="loadOperationLogs()"
+                                   placeholder="filter operation, press Enter">
+                        </div>
+                        <div class="h-[360px] overflow-y-auto rounded border border-slate-800 bg-slate-950 p-3 text-xs">
+                            <p class="text-slate-500" x-show="operationLogsLoading">Loading operation history...</p>
+                            <p class="text-slate-500" x-show="!operationLogsLoading && operationLogs.length === 0">No operation history yet.</p>
+                            <template x-for="entry in operationLogs" :key="entry.event_id || `${entry.timestamp}-${entry.operation}`">
+                                <details class="mb-2 rounded border border-slate-800 bg-slate-900 px-2 py-2">
+                                    <summary class="cursor-pointer list-none">
+                                        <div class="flex items-start justify-between gap-2">
+                                            <div class="min-w-0">
+                                                <div class="truncate text-slate-200" x-text="operationLabel(entry)"></div>
+                                                <div class="mt-1 truncate text-[10px] text-slate-500" x-text="operationSummary(entry)"></div>
+                                            </div>
+                                            <span class="shrink-0 rounded border px-1.5 py-0.5 text-[10px]"
+                                                  :class="operationStatusClass(entry.status)" x-text="entry.status || 'unknown'"></span>
+                                        </div>
+                                        <div class="mt-1 flex justify-between gap-2 text-[10px] text-slate-500">
+                                            <span x-text="formatOperationTime(entry.timestamp || entry.time)"></span>
+                                            <span x-text="entry.actor && entry.actor.username ? entry.actor.username : ''"></span>
+                                        </div>
+                                    </summary>
+                                    <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all border-t border-slate-800 pt-2 text-[10px] text-slate-400"
+                                         x-text="JSON.stringify(entry, null, 2)"></pre>
+                                </details>
+                            </template>
+                        </div>
+                    </div>
                 </div>
             </section>
         </main>
@@ -1666,6 +1801,9 @@
                 candidates: [],
                 jobs: [],
                 activeJob: null,
+                operationLogs: [],
+                operationLogsLoading: false,
+                operationLogFilter: {status: '', operation: ''},
                 activeGroup: 'preprocess',
                 activeTab: 'cache',
                 consoleMode: {{ console_mode|tojson }},
@@ -1732,6 +1870,10 @@
                 preprocess: {
                     schema_op: 'convert_action',
                     target_dim: 16,
+                    v3_data_file_size_mb: 100,
+                    v3_video_file_size_mb: 200,
+                    v3_workers: 8,
+                    v3_image_video_mode: 'lerobot_official',
                     field_name: '',
                     smooth_window: 5,
                     smooth_workers: 0,
@@ -1796,6 +1938,7 @@
                     write_parquet: false,
                     write_subtask: false,
                     force_recompute_stage: false,
+                    fallback_stage_count: 5,
                     overwrite_subtask_text: false
                 },
                 labeling: {
@@ -1862,7 +2005,8 @@
                     }
                     const startupLoads = [
                         this.safeStartupLoad(() => this.loadDatasetRoots()),
-                        this.safeStartupLoad(() => this.loadJobs())
+                        this.safeStartupLoad(() => this.loadJobs()),
+                        this.safeStartupLoad(() => this.loadOperationLogs())
                     ];
                     if (['quality_flags', 'standardize', 'transform', 'dataset_ops', 'split_merge'].some(tab => this.tabEnabled(tab))) {
                         startupLoads.push(this.safeStartupLoad(() => this.loadPreprocessCapabilities()));
@@ -1933,7 +2077,7 @@
                 syncSchemaOpForTab(tab) {
                     const allowed = {
                         standardize: ['standardize'],
-                        transform: ['convert_action', 'drop_field', 'smooth_action'],
+                        transform: ['convert_action', 'convert_v3', 'drop_field', 'smooth_action'],
                         dataset_ops: this.consoleMode === 'visualize'
                             ? ['delete_episodes']
                             : ['rewrite_prompts', 'fix_prompt_prepositions', 'apply_prompt_assignments', 'delete_episodes'],
@@ -2060,7 +2204,10 @@
                             }
                         }
                         if (!response.ok) {
-                            throw new Error(data.error || `request failed: ${response.status}`);
+                            const requestError = new Error(data.error || `request failed: ${response.status}`);
+                            requestError.status = response.status;
+                            requestError.payload = data;
+                            throw requestError;
                         }
                         return data;
                     } catch (err) {
@@ -2261,6 +2408,9 @@
                     if (datasetChanged) this.resetDeleteFlagReasonState();
                     this.selectedDataset = dataset;
                     this.selectedDatasetKey = dataset.key;
+                    if (this.selectedDatasetIsV3() && this.preprocess.schema_op === 'convert_v3') {
+                        this.preprocess.schema_op = 'convert_action';
+                    }
                     this.applyDatasetDataVersion(dataset, datasetChanged);
                     this.storeDatasetKey(dataset.key);
                     if (updateUrl) this.updateHomeUrl();
@@ -2273,6 +2423,9 @@
                     this.constructionLoading = false;
                     this.registration.root = dataset.root || this.registration.root;
                     this.construction.out_root = this.syntheticDefaultPath(dataset.root);
+                    this.loadOperationLogs().catch(err => {
+                        if (token === this.selectionToken && !this.error) this.error = err.message;
+                    });
                     const detailPromise = this.finishDatasetSelection(dataset, token);
                     if (options.deferDetails) {
                         detailPromise.catch(err => {
@@ -2506,6 +2659,15 @@
                         return Boolean(this.preprocess.prompt_pattern.trim() && this.preprocess.prompt_replacement.trim());
                     }
                     if (this.preprocess.schema_op === 'drop_field') return Boolean(this.preprocess.field_name.trim());
+                    if (this.preprocess.schema_op === 'convert_v3') {
+                        return !this.selectedDatasetIsV3()
+                            && Number(this.preprocess.v3_data_file_size_mb || 0) > 0
+                            && Number(this.preprocess.v3_video_file_size_mb || 0) > 0
+                            && Number(this.preprocess.v3_workers || 0) > 0;
+                    }
+                    if (this.preprocess.schema_op === 'repair_v3_video_timestamps') {
+                        return this.selectedDatasetIsV3();
+                    }
                     if (this.preprocess.schema_op === 'smooth_action') {
                         const window = Number(this.preprocess.smooth_window || 0);
                         const workers = Number(this.preprocess.smooth_workers || 0);
@@ -2529,6 +2691,8 @@
                     if (this.preprocess.schema_op === 'delete_episodes') return 'Delete episodes';
                     if (this.preprocess.schema_op === 'standardize') return this.preprocess.schema_dry_run ? 'Preview standardize' : 'Standardize dataset';
                     if (this.preprocess.schema_op === 'convert_action') return this.preprocess.schema_dry_run ? 'Preview conversion' : 'Convert action/state dim';
+                    if (this.preprocess.schema_op === 'convert_v3') return this.preprocess.schema_dry_run ? 'Preview v3.0 conversion' : 'Convert dataset to v3.0';
+                    if (this.preprocess.schema_op === 'repair_v3_video_timestamps') return this.preprocess.schema_dry_run ? 'Preview timestamp repair' : 'Repair v3 video timestamps';
                     if (this.preprocess.schema_op === 'drop_field') return this.preprocess.schema_dry_run ? 'Preview drop field' : 'Drop field';
                     if (this.preprocess.schema_op === 'smooth_action') return this.preprocess.schema_dry_run ? 'Preview smoothing' : 'Smooth action/state';
                     if (this.preprocess.schema_op === 'rewrite_prompts') return this.preprocess.schema_dry_run ? 'Preview prompt rewrite' : 'Rewrite prompts';
@@ -2556,7 +2720,7 @@
                     }
                     return (this.preprocess.merge_src_keys || []).length >= 2;
                 },
-                async startPreprocessJob(url, payload, datasetKey = null) {
+                async startPreprocessJob(url, payload, datasetKey = null, confirmOverwrite = false) {
                     this.error = '';
                     this.busy = true;
                     try {
@@ -2566,6 +2730,20 @@
                         else this.syncActiveJob();
                         this.pollJob(data.job.id);
                     } catch (err) {
+                        if (
+                            confirmOverwrite
+                            && err.status === 409
+                            && err.payload
+                            && err.payload.requires_overwrite_confirmation
+                        ) {
+                            const outputRoot = err.payload.output_root || 'the output directory';
+                            if (confirm(`Output dataset already exists:\n${outputRoot}\n\nOverwrite it?`)) {
+                                payload.options = payload.options || {};
+                                payload.options.overwrite = true;
+                                return await this.startPreprocessJob(url, payload, datasetKey, false);
+                            }
+                            return;
+                        }
                         this.error = err.message;
                     } finally {
                         this.busy = false;
@@ -2581,8 +2759,42 @@
                     return datasetKey;
                 },
                 async startSchemaFix() {
-                    const datasetKey = await this.ensureSelectedDatasetLoaded();
+                    const datasetKey = this.preprocess.schema_op === 'convert_v3'
+                        ? (this.selectedDataset && this.selectedDataset.key)
+                        : await this.ensureSelectedDatasetLoaded();
                     if (!datasetKey) return;
+                    if (this.preprocess.schema_op === 'convert_v3') {
+                        await this.startPreprocessJob('/api/preprocess/convert_v3/start', {
+                            dataset_key: datasetKey,
+                            options: {
+                                out_root: this.preprocess.schema_out_root,
+                                data_file_size_in_mb: this.preprocess.v3_data_file_size_mb,
+                                video_file_size_in_mb: this.preprocess.v3_video_file_size_mb,
+                                workers: this.preprocess.v3_workers,
+                                image_video_mode: this.preprocess.v3_image_video_mode,
+                                dry_run: this.preprocess.schema_dry_run
+                            }
+                        }, datasetKey, true);
+                        return;
+                    }
+                    if (this.preprocess.schema_op === 'repair_v3_video_timestamps') {
+                        if (
+                            !this.preprocess.schema_dry_run
+                            && !confirm(
+                                `Repair v3 video timestamps for ${datasetKey}?\n\n`
+                                + 'MP4 containers and meta/episodes timestamps will be rewritten. Videos are not re-encoded.'
+                            )
+                        ) return;
+                        await this.startPreprocessJob(
+                            '/api/preprocess/repair_v3_video_timestamps/start',
+                            {
+                                dataset_key: datasetKey,
+                                options: {dry_run: this.preprocess.schema_dry_run}
+                            },
+                            datasetKey
+                        );
+                        return;
+                    }
                     if (this.preprocess.schema_op === 'delete_episodes') {
                         if (this.preprocess.delete_flag_reason && this.deleteFlagReasonDatasetKey !== datasetKey) {
                             await this.loadDeleteFlagReasonOptions(true);
@@ -2644,7 +2856,7 @@
                     }
                     if (this.preprocess.schema_op === 'rewrite_prompts') {
                         if (!this.preprocess.schema_dry_run) {
-                            const ok = confirm(`Rewrite prompts in ${datasetKey}?\n\nThis modifies meta/tasks.jsonl and meta/episodes.jsonl in-place. A backup will be created.`);
+                            const ok = confirm(`Rewrite prompts in ${datasetKey}?\n\nThis modifies task and episode metadata (v2.1 JSONL or v3 Parquet) in-place. A backup will be created.`);
                             if (!ok) return;
                         }
                         await this.startPreprocessJob('/api/preprocess/rewrite_prompts/start', {
@@ -2660,7 +2872,7 @@
                     }
                     if (this.preprocess.schema_op === 'fix_prompt_prepositions') {
                         if (!this.preprocess.schema_dry_run) {
-                            const ok = confirm(`Fix prompt prepositions in ${datasetKey}?\n\nAbsolute: on the left/right.\nRelative: to the left/right of ...\n\nThis modifies meta/tasks.jsonl and meta/episodes.jsonl in-place. A backup will be created.`);
+                            const ok = confirm(`Fix prompt prepositions in ${datasetKey}?\n\nAbsolute: on the left/right.\nRelative: to the left/right of ...\n\nThis modifies task and episode metadata (v2.1 JSONL or v3 Parquet) in-place. A backup will be created.`);
                             if (!ok) return;
                         }
                         await this.startPreprocessJob('/api/preprocess/fix_prompt_prepositions/start', {
@@ -2675,8 +2887,8 @@
                     if (this.preprocess.schema_op === 'apply_prompt_assignments') {
                         const episodes = this.preprocess.apply_prompt_assignment_episode_ids.trim();
                         const message = episodes
-                            ? `Apply pending prompt repairs for episodes ${episodes} in ${datasetKey}?\n\nThis modifies meta/episodes.jsonl and parquet task_index in-place.`
-                            : `Apply all pending prompt repairs in ${datasetKey}?\n\nThis modifies meta/episodes.jsonl and parquet task_index in-place.`;
+                            ? `Apply pending prompt repairs for episodes ${episodes} in ${datasetKey}?\n\nThis modifies episode metadata and Parquet task_index in-place.`
+                            : `Apply all pending prompt repairs in ${datasetKey}?\n\nThis modifies episode metadata and Parquet task_index in-place.`;
                         if (!confirm(message)) return;
                         await this.startPreprocessJob('/api/preprocess/apply_prompt_assignments/start', {
                             dataset_key: datasetKey,
@@ -2729,7 +2941,7 @@
                     const datasetKey = await this.ensureSelectedDatasetLoaded();
                     if (!datasetKey) return;
                     const ok = window.confirm(
-                        `Normalize prompts to lowercase in ${datasetKey}?\\n\\nThis modifies meta/tasks.jsonl, meta/episodes.jsonl, pending viewer prompt assignments, and parquet task_index when duplicate tasks merge. A metadata backup will be created.`
+                        `Normalize prompts to lowercase in ${datasetKey}?\\n\\nThis modifies task/episode metadata, pending viewer prompt assignments, and Parquet task_index when duplicate tasks merge. A metadata backup will be created.`
                     );
                     if (!ok) return;
                     await this.startPreprocessJob('/api/preprocess/lowercase_prompts/start', {
@@ -3076,6 +3288,43 @@
                         this.pollJob(this.activeJob.id);
                     }
                 },
+                async loadOperationLogs() {
+                    this.operationLogsLoading = true;
+                    try {
+                        const params = new URLSearchParams({limit: '200'});
+                        if (this.selectedDatasetKey) params.set('dataset_key', this.selectedDatasetKey);
+                        if (this.operationLogFilter.status) params.set('status', this.operationLogFilter.status);
+                        if (this.operationLogFilter.operation) params.set('operation', this.operationLogFilter.operation);
+                        const data = await this.requestJson(`/api/operation_log?${params.toString()}`);
+                        this.operationLogs = data.operations || [];
+                    } finally {
+                        this.operationLogsLoading = false;
+                    }
+                },
+                operationLabel(entry) {
+                    return String(entry.operation || entry.op || 'unknown').replaceAll('_', ' ');
+                },
+                operationSummary(entry) {
+                    const parts = [];
+                    if (entry.phase) parts.push(entry.phase);
+                    const episodes = Array.isArray(entry.episode_ids) ? entry.episode_ids : [];
+                    if (episodes.length) parts.push(`episodes ${episodes.join(', ')}`);
+                    const details = entry.details || {};
+                    if (details.job_id) parts.push(`job ${details.job_id}`);
+                    if (details.error) parts.push(String(details.error));
+                    return parts.join(' · ');
+                },
+                operationStatusClass(status) {
+                    if (status === 'success' || status === 'ok') return 'border-emerald-800 text-emerald-300';
+                    if (status === 'failed' || status === 'error') return 'border-red-800 text-red-300';
+                    if (status === 'accepted' || status === 'started') return 'border-sky-800 text-sky-300';
+                    return 'border-slate-700 text-slate-400';
+                },
+                formatOperationTime(value) {
+                    if (!value) return '';
+                    const date = new Date(value);
+                    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+                },
                 jobBelongsToSelectedDataset(job) {
                     if (!job || !this.selectedDatasetKey) return false;
                     if (job.dataset_key === this.selectedDatasetKey) return true;
@@ -3154,6 +3403,7 @@
                                 this.pollJobId = null;
                                 await this.loadDatasets();
                                 if (this.selectedDatasetKey) await this.loadDatasetDetails(this.selectedDatasetKey);
+                                await this.loadOperationLogs();
                             } else {
                                 schedule(750);
                             }
@@ -3307,6 +3557,13 @@
                     return this.mutationFields.some(field => this.options[field.key]);
                 },
                 canStart() {
+                    if (this.selectedDatasetIsV3()) {
+                        return Boolean(
+                            this.selectedDataset
+                            && this.selectedDataset.loaded
+                            && (this.options.prepare_videos || this.options.prepare_csv)
+                        );
+                    }
                     return Boolean(this.selectedDataset && this.selectedDataset.loaded) && (
                         this.options.prepare_videos ||
                         this.options.prepare_csv ||
@@ -3314,7 +3571,20 @@
                     );
                 },
                 canOpenViewer() {
-                    return Boolean(this.selectedDataset && this.selectedDataset.loaded && this.selectedDataset.cache && this.selectedDataset.cache.status === 'cached');
+                    return Boolean(
+                        this.selectedDataset
+                        && this.selectedDataset.loaded
+                        && this.selectedDataset.cache
+                        && this.selectedDataset.cache.status === 'cached'
+                    );
+                },
+                selectedDatasetIsV3() {
+                    return this.datasetIsV3(this.selectedDataset);
+                },
+                datasetIsV3(dataset) {
+                    if (!dataset) return false;
+                    const version = String(dataset.dataset_format_version || '').replace(/^v/i, '');
+                    return version === '3' || version.startsWith('3.');
                 },
                 canStartLabeling() {
                     return Boolean(
@@ -3624,6 +3894,7 @@
                 openViewerText() {
                     if (!this.selectedDataset) return 'Select dataset first';
                     if (!this.selectedDataset.loaded) return 'Load dataset first';
+                    if (this.selectedDatasetIsV3() && !this.canOpenViewer()) return 'Prepare v3.0 viewer cache first';
                     return this.canOpenViewer() ? 'Open viewer' : 'Prepare video + CSV first';
                 },
                 viewerUrl() {

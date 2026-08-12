@@ -5,10 +5,10 @@ import json
 import re
 from pathlib import Path
 
-from PIL import Image
-
-from lerobot.data_platform.precompute.image_io import read_image_bytes
-
+from lerobot.data_platform.precompute.dataset_io import (
+    read_episode_frame_image,
+    update_episode_metadata,
+)
 
 _VARIANT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
@@ -100,14 +100,7 @@ def available_label_variants(labeling_dir: Path) -> list[dict]:
     latest_variant = latest_label_variant(labeling_dir)
     variants: dict[str, dict] = {}
 
-    if labels_path(labeling_dir).is_file():
-        variant = latest_variant or ""
-        variants[variant] = {
-            "id": variant,
-            "label": variant or "latest",
-            "is_latest": True,
-        }
-    elif reviewed_path(labeling_dir).is_file():
+    if labels_path(labeling_dir).is_file() or reviewed_path(labeling_dir).is_file():
         variant = latest_variant or ""
         variants[variant] = {
             "id": variant,
@@ -221,7 +214,9 @@ def remove_reviewed_record(labeling_dir: Path, episode_index: int) -> None:
     remove_reviewed_record_for_variant(labeling_dir, episode_index, variant=None)
 
 
-def remove_reviewed_record_for_variant(labeling_dir: Path, episode_index: int, variant: str | None = None) -> None:
+def remove_reviewed_record_for_variant(
+    labeling_dir: Path, episode_index: int, variant: str | None = None
+) -> None:
     labeling_dir = Path(labeling_dir)
     variant = normalize_label_variant(variant)
     path = reviewed_path(labeling_dir, variant)
@@ -327,7 +322,11 @@ def load_episode_record(labeling_dir: Path, episode_index: int, variant: str | N
 
 
 def image_keys_from_meta(meta) -> list[str]:
-    return [key for key, feature in getattr(meta, "features", {}).items() if feature.get("dtype") == "image"]
+    return [
+        key
+        for key, feature in getattr(meta, "features", {}).items()
+        if feature.get("dtype") in {"image", "video"}
+    ]
 
 
 def read_first_frame_image(root: Path, meta, episode_index: int, image_key: str | None = None):
@@ -343,13 +342,13 @@ def read_frame_image(root: Path, meta, episode_index: int, frame_index: int, ima
     elif image_key not in image_keys:
         raise ValueError(f"Image key is not an image feature: {image_key}")
 
-    parquet_path = Path(root) / meta.get_data_file_path(episode_index)
-    image_bytes = read_image_bytes(parquet_path, Path(root), image_key, int(frame_index))
-    if image_bytes is None:
-        raise FileNotFoundError(
-            f"Could not read frame {frame_index} image for episode {episode_index} from {parquet_path}"
-        )
-    return Image.open(io.BytesIO(image_bytes)).convert("RGB"), image_key
+    return read_episode_frame_image(
+        Path(root),
+        meta,
+        int(episode_index),
+        int(frame_index),
+        image_key=image_key,
+    )
 
 
 def read_first_frame_jpeg(root: Path, meta, episode_index: int, image_key: str | None = None) -> bytes:
@@ -386,30 +385,15 @@ def merge_reviewed_labels_to_metadata(root: Path, labeling_dir: Path, variant: s
         raise FileNotFoundError(f"Reviewed labels not found: {reviewed_file}")
 
     reviewed = load_labels_jsonl(reviewed_file)
-    episodes_path = root / "meta" / "episodes.jsonl"
-    if not episodes_path.is_file():
-        raise FileNotFoundError(f"Dataset episodes metadata not found: {episodes_path}")
-
-    rows = []
-    with episodes_path.open() as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-
-    merged = 0
-    merged_episodes = []
-    for row in rows:
-        episode_index = int(row["episode_index"])
-        record = reviewed.get(episode_index)
-        if record is None:
-            continue
-        row["first_frame_bbox"] = first_frame_bbox_from_record(record, source="reviewed")
-        merged += 1
-        merged_episodes.append(episode_index)
-
-    _write_jsonl_atomic(episodes_path, rows)
+    updates = {
+        int(episode_index): {"first_frame_bbox": first_frame_bbox_from_record(record, source="reviewed")}
+        for episode_index, record in reviewed.items()
+    }
+    merged_episodes = update_episode_metadata(root, updates)
     return {
-        "merged": merged,
+        "merged": len(merged_episodes),
         "episodes": merged_episodes,
-        "episodes_path": str(episodes_path),
+        "episodes_path": str(
+            root / "meta" / ("episodes" if (root / "meta" / "episodes").is_dir() else "episodes.jsonl")
+        ),
     }

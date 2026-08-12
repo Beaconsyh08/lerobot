@@ -5,14 +5,15 @@ import logging
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
 
+import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
-from lerobot.data_platform.precompute.image_io import get_parquet_file
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
 from lerobot.data_platform.precompute.labeling.bbox_select import select_bbox_with_context
 from lerobot.data_platform.precompute.labeling.detector import (
     DEFAULT_BACKEND,
@@ -27,8 +28,8 @@ from lerobot.data_platform.precompute.labeling.review import (
     labels_path,
     load_labels_jsonl,
     migrate_latest_labels_to_variant,
-    read_frame_image,
     read_first_frame_image,
+    read_frame_image,
     resolved_labels_path,
     resolved_reviewed_path,
     reviewed_path,
@@ -37,7 +38,6 @@ from lerobot.data_platform.precompute.labeling.review import (
 from lerobot.data_platform.precompute.labeling.task_parser import expand_prompts, parse_task
 from lerobot.data_platform.precompute.labeling.vis import draw_detections
 from lerobot.data_platform.precompute.tagging.review import current_tags
-
 
 LABELING_FLAGGED_EPISODES = "labeling_flagged_episodes.json"
 LABELING_MISSING_TARGET_ISSUE_TYPE = "object_labeling"
@@ -129,10 +129,9 @@ def _episode_task_from_meta(meta, episode_index: int) -> str | None:
 
 def _episode_task_from_parquet(root: Path, meta, episode_index: int) -> str | None:
     parquet_path = root / meta.get_data_file_path(episode_index)
-    parquet_file = get_parquet_file(str(parquet_path))
-    if "task_index" not in parquet_file.schema_arrow.names:
+    if "task_index" not in pq.read_schema(parquet_path).names:
         return None
-    table = parquet_file.read_row_group(0, columns=["task_index"])
+    table = read_episode_table(root, meta, episode_index, columns=["task_index"])
     if len(table) == 0:
         return None
     task_index = int(table["task_index"][0].as_py())
@@ -161,8 +160,7 @@ def _value_is_zero(value) -> bool:
 
 def _episode_exist_label_zero(root: Path, meta, episode_index: int) -> bool:
     parquet_path = root / meta.get_data_file_path(episode_index)
-    parquet_file = get_parquet_file(str(parquet_path))
-    column_names = parquet_file.schema_arrow.names
+    column_names = pq.read_schema(parquet_path).names
     column_name = None
     if "exist_label" in column_names:
         column_name = "exist_label"
@@ -171,7 +169,7 @@ def _episode_exist_label_zero(root: Path, meta, episode_index: int) -> bool:
     if column_name is None:
         return False
 
-    table = parquet_file.read_row_group(0, columns=[column_name])
+    table = read_episode_table(root, meta, episode_index, columns=[column_name])
     if len(table) == 0:
         return False
     return _value_is_zero(table[column_name][0].as_py())
@@ -305,14 +303,15 @@ def _sync_missing_target_flags(
         issue
         for issue in existing_issues
         if isinstance(issue, dict)
-        and not (
-            _is_labeling_missing_target_issue(issue)
-            and (_issue_episode(issue) in scanned_episodes)
-        )
+        and not (_is_labeling_missing_target_issue(issue) and (_issue_episode(issue) in scanned_episodes))
     ]
     merged_issues = sorted(
         kept_issues + missing_issues,
-        key=lambda issue: (int(issue.get("episode", -1)), str(issue.get("type", "")), str(issue.get("reason", ""))),
+        key=lambda issue: (
+            int(issue.get("episode", -1)),
+            str(issue.get("type", "")),
+            str(issue.get("reason", "")),
+        ),
     )
     _write_json(issues_path, merged_issues)
 
@@ -466,7 +465,9 @@ def run_labeling(
         vis_dir.mkdir(parents=True, exist_ok=True)
     run_mode = str(run_mode or LABELING_RUN_MODE_MISSING).strip().lower()
     if run_mode not in LABELING_RUN_MODES:
-        raise ValueError(f"Unknown object labeling run_mode: {run_mode}. Expected one of {sorted(LABELING_RUN_MODES)}")
+        raise ValueError(
+            f"Unknown object labeling run_mode: {run_mode}. Expected one of {sorted(LABELING_RUN_MODES)}"
+        )
 
     requested_episodes = sorted(getattr(meta, "episodes", {}).keys()) if episodes is None else list(episodes)
     selected_episodes = []
@@ -513,7 +514,9 @@ def run_labeling(
         existing_reviewed_records = load_labels_jsonl(resolved_reviewed_path(labeling_dir, result_variant))
         completed_episodes = set(existing_label_records) | set(existing_reviewed_records)
         before_filter = len(selected_episodes)
-        selected_episodes = [episode_index for episode_index in selected_episodes if episode_index not in completed_episodes]
+        selected_episodes = [
+            episode_index for episode_index in selected_episodes if episode_index not in completed_episodes
+        ]
         skipped_existing = before_filter - len(selected_episodes)
 
     if not selected_episodes:
@@ -626,6 +629,7 @@ def run_labeling(
         if show_progress
         else None
     )
+
     def _write_source_files() -> None:
         for output_path in source_output_paths:
             _write_source_json(
@@ -778,7 +782,9 @@ def run_labeling(
                             text_threshold=text_threshold,
                         )
                     except Exception as exc:
-                        logging.warning("Could not use last frame for object labeling episode %s: %s", episode_index, exc)
+                        logging.warning(
+                            "Could not use last frame for object labeling episode %s: %s", episode_index, exc
+                        )
             selected, relation_satisfied, selection_method = select_bbox_with_context(
                 detections_target,
                 detections_ref if parsed["reference"] is not None else None,
@@ -840,7 +846,9 @@ def run_labeling(
             )
 
     try:
-        records_by_episode: dict[int, dict] = dict(existing_label_records) if run_mode == LABELING_RUN_MODE_MISSING else {}
+        records_by_episode: dict[int, dict] = (
+            dict(existing_label_records) if run_mode == LABELING_RUN_MODE_MISSING else {}
+        )
         scanned_records_by_episode: dict[int, dict] = {}
         if effective_workers == 1:
             for idx, episode_index in enumerate(selected_episodes, start=1):
@@ -866,7 +874,7 @@ def run_labeling(
                         current=idx - 1,
                         total=len(selected_episodes),
                         episode=episode_index,
-                    message=f"{backend} failed for episode {episode_index}: {record['error_detail']}",
+                        message=f"{backend} failed for episode {episode_index}: {record['error_detail']}",
                     )
                 if progress is not None:
                     progress.update(1)
@@ -945,15 +953,13 @@ def run_labeling(
                         executor.submit(_label_episode_in_worker, episode_index): episode_index
                         for episode_index in selected_episodes
                     }
-                    completed = 0
-                    for future in as_completed(future_to_episode):
+                    for completed, future in enumerate(as_completed(future_to_episode), start=1):
                         episode_index = future_to_episode[future]
                         record, failed = future.result()
                         failed_count += int(failed)
                         records_by_episode[episode_index] = record
                         scanned_records_by_episode[episode_index] = record
                         _append_record(record)
-                        completed += 1
                         if failed:
                             _emit_progress(
                                 progress_callback,
@@ -991,7 +997,9 @@ def run_labeling(
         )
         missing_target_count = int(flag_summary.get("missing_target_count", 0))
         if missing_target_count:
-            logging.info("Object labeling auto-flagged %d episodes with no target detections", missing_target_count)
+            logging.info(
+                "Object labeling auto-flagged %d episodes with no target detections", missing_target_count
+            )
     finally:
         if progress is not None:
             progress.close()
@@ -1011,7 +1019,9 @@ def run_labeling(
         step="done",
         current=len(selected_episodes),
         total=len(selected_episodes),
-        message=f"Object labeling complete ({', '.join(done_notes)})" if done_notes else "Object labeling complete",
+        message=f"Object labeling complete ({', '.join(done_notes)})"
+        if done_notes
+        else "Object labeling complete",
     )
     return LabelingResult(
         root=root,

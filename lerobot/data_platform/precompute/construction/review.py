@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 import pyarrow as pa
@@ -12,6 +13,10 @@ from lerobot.data_platform.precompute.construction.writer import (
     _episode_chunk,
     _stats_from_table,
     _video_path,
+)
+from lerobot.data_platform.precompute.dataset_io import (
+    is_v3_dataset,
+    load_episode_records,
 )
 
 
@@ -104,6 +109,88 @@ def finalize(out_root: Path) -> dict:
         for record in plan_doc.get("records", [])
         if bool(record.get("rejected"))
     }
+    if is_v3_dataset(out_root):
+        old_episodes = load_episode_records(out_root)
+        if not rejected:
+            return {"removed": 0, "remaining": len(old_episodes)}
+        kept = [row for row in old_episodes if int(row["episode_index"]) not in rejected]
+        if not kept:
+            raise ValueError("Construction review cannot reject every episode")
+        old_to_new = {int(row["episode_index"]): new_index for new_index, row in enumerate(kept)}
+        new_records = []
+        for record in plan_doc.get("records", []):
+            old_index = int(record["new_episode_index"])
+            if old_index in rejected:
+                continue
+            if old_index in old_to_new:
+                updated = dict(record)
+                updated["new_episode_index"] = old_to_new[old_index]
+                updated["rejected"] = False
+                updated["reject_reason"] = None
+                updated["decision"] = "accept"
+                new_records.append(updated)
+        plan_doc["records"] = new_records
+
+        from lerobot.data_platform.precompute.preprocess.dataset_merge import run_merge
+
+        with tempfile.TemporaryDirectory(
+            prefix=f".{out_root.name}.construction-finalize-",
+            dir=out_root.parent,
+        ) as temp_dir:
+            temp_root = Path(temp_dir)
+            rebuilt_root = temp_root / "rebuilt"
+            run_merge(
+                [out_root],
+                out_root=rebuilt_root,
+                workers=8,
+                exclude_episodes=[rejected],
+                _allow_single_source=True,
+                _op="construction_finalize",
+                _default_op="construction_finalize",
+            )
+            generated_meta = rebuilt_root / "meta"
+            for child in (out_root / "meta").iterdir():
+                if child.name in {
+                    "episodes",
+                    "info.json",
+                    "stats.json",
+                    "tasks.parquet",
+                    "construction_plan.json",
+                }:
+                    continue
+                destination = generated_meta / child.name
+                if destination.exists():
+                    continue
+                if child.is_dir():
+                    shutil.copytree(child, destination, symlinks=True)
+                else:
+                    shutil.copy2(child, destination, follow_symlinks=False)
+            (generated_meta / "construction_plan.json").write_text(
+                json.dumps(plan_doc, indent=2, ensure_ascii=False) + "\n"
+            )
+
+            backup_root = temp_root / "backup"
+            backup_root.mkdir()
+            replaced = []
+            try:
+                for name in ("data", "meta", "videos"):
+                    current = out_root / name
+                    if current.exists():
+                        current.rename(backup_root / name)
+                    replaced.append(name)
+                    generated = rebuilt_root / name
+                    if generated.exists():
+                        generated.rename(current)
+            except Exception:
+                for name in reversed(replaced):
+                    current = out_root / name
+                    if current.is_dir():
+                        shutil.rmtree(current)
+                    backup = backup_root / name
+                    if backup.exists():
+                        backup.rename(current)
+                raise
+        return {"removed": len(rejected), "remaining": len(kept)}
     if not rejected:
         return {"removed": 0, "remaining": len(_read_jsonl(out_root / "meta" / "episodes.jsonl"))}
 
@@ -143,7 +230,9 @@ def finalize(out_root: Path) -> dict:
         task_idx = task_index_for(str(task))
 
         table = _set_column(table, "episode_index", [new_idx] * table.num_rows, pa.int64())
-        table = _set_column(table, "index", list(range(global_offset, global_offset + table.num_rows)), pa.int64())
+        table = _set_column(
+            table, "index", list(range(global_offset, global_offset + table.num_rows)), pa.int64()
+        )
         table = _set_column(table, "task_index", [task_idx] * table.num_rows, pa.int64())
         out_data_path = tmp_data / _data_path(info, new_idx).relative_to("data")
         out_data_path.parent.mkdir(parents=True, exist_ok=True)

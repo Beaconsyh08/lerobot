@@ -9,6 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.dataset_io import is_v3_info
 from lerobot.data_platform.precompute.preprocess.action_dim import _trim_arrow_type
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
@@ -23,13 +24,14 @@ from lerobot.data_platform.precompute.preprocess.common import (
     write_json,
     write_jsonl,
 )
+from lerobot.data_platform.precompute.preprocess.field_ops import _drop_field_from_v3_stats
+from lerobot.data_platform.precompute.preprocess.smooth_action import _rewrite_v3_stats
 from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
     infer_data_version_from_features,
     normalize_gripper_columns,
 )
-
 
 ACTION_COLUMN = "action"
 STATE_COLUMN = "state"
@@ -103,12 +105,6 @@ def _column_stats(values: list) -> dict:
     }
 
 
-def _episode_index(table: pa.Table, fallback: int) -> int:
-    if "episode_index" not in table.column_names or table.num_rows == 0:
-        return fallback
-    return int(table["episode_index"][0].as_py())
-
-
 def _fallback_episode_index(path: Path) -> int:
     stem = path.stem
     if stem.startswith("episode_"):
@@ -116,11 +112,15 @@ def _fallback_episode_index(path: Path) -> int:
     raise ValueError(f"Cannot infer episode index from parquet path: {path}")
 
 
-def _rewrite_parquet(src: Path, dst: Path, data_version: str) -> tuple[int, dict[str, dict], set[str], dict[str, int]]:
+def _rewrite_parquet(
+    src: Path,
+    dst: Path,
+    data_version: str,
+) -> tuple[dict[int, dict[str, dict]], set[str], dict[str, int]]:
     table = pq.read_table(src)
     arrays = []
     fields = []
-    stats: dict[str, dict] = {}
+    rewritten_columns: dict[str, list] = {}
     dropped_fields: set[str] = set()
     dims_after: dict[str, int] = {}
     has_exist_label = EXIST_LABEL_COLUMN in table.column_names
@@ -131,10 +131,10 @@ def _rewrite_parquet(src: Path, dst: Path, data_version: str) -> tuple[int, dict
             continue
         if field.name in {ACTION_COLUMN, STATE_COLUMN}:
             values = _normalize_then_trim(table[field.name].to_pylist(), field.name, data_version)
+            rewritten_columns[field.name] = values
             target_type = _trim_arrow_type(field.type, TARGET_DIM)
             arrays.append(pa.array(values, type=target_type))
             fields.append(pa.field(field.name, target_type, nullable=field.nullable, metadata=field.metadata))
-            stats[field.name] = _column_stats(values)
             dims_after[field.name] = TARGET_DIM
             continue
         arrays.append(table[field.name])
@@ -142,16 +142,40 @@ def _rewrite_parquet(src: Path, dst: Path, data_version: str) -> tuple[int, dict
 
     if not has_exist_label:
         values = [1] * table.num_rows
+        rewritten_columns[EXIST_LABEL_COLUMN] = values
         arrays.append(pa.array(values, type=pa.int32()))
         fields.append(pa.field(EXIST_LABEL_COLUMN, pa.int32()))
-        stats[EXIST_LABEL_COLUMN] = _column_stats(values)
+
+    if "episode_index" in table.column_names:
+        episode_values = [int(value) for value in table["episode_index"].to_pylist()]
+        episode_indices = list(dict.fromkeys(episode_values))
+        positions_by_episode = {
+            episode_index: [
+                position for position, value in enumerate(episode_values) if value == episode_index
+            ]
+            for episode_index in episode_indices
+        }
+    else:
+        episode_index = _fallback_episode_index(src)
+        positions_by_episode = {episode_index: list(range(table.num_rows))}
+
+    stats_by_episode = {}
+    for episode_index, positions in positions_by_episode.items():
+        stats_by_episode[episode_index] = {
+            column: _column_stats([values[position] for position in positions])
+            for column, values in rewritten_columns.items()
+        }
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata=table.schema.metadata)), dst)
-    return _episode_index(table, _fallback_episode_index(src)), stats, dropped_fields, dims_after
+    pq.write_table(
+        pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata=table.schema.metadata)), dst
+    )
+    return stats_by_episode, dropped_fields, dims_after
 
 
-def _rewrite_parquet_worker(args: tuple[str, str, str]) -> tuple[int, dict[str, dict], set[str], dict[str, int]]:
+def _rewrite_parquet_worker(
+    args: tuple[str, str, str],
+) -> tuple[dict[int, dict[str, dict]], set[str], dict[str, int]]:
     src, dst, data_version = args
     return _rewrite_parquet(Path(src), Path(dst), data_version)
 
@@ -181,11 +205,16 @@ def _update_info(info: dict, dropped_fields: set[str]) -> dict:
             else:
                 shape = [TARGET_DIM]
             features[key]["shape"] = shape
-    features.setdefault(EXIST_LABEL_COLUMN, EXIST_LABEL_FEATURE)
+    exist_label_feature = dict(EXIST_LABEL_FEATURE)
+    if is_v3_info(updated):
+        exist_label_feature["fps"] = int(updated["fps"])
+    features.setdefault(EXIST_LABEL_COLUMN, exist_label_feature)
     return updated
 
 
-def _rewrite_stats(src: Path, dst: Path, stats_by_episode: dict[int, dict[str, dict]], dropped_fields: set[str]) -> None:
+def _rewrite_stats(
+    src: Path, dst: Path, stats_by_episode: dict[int, dict[str, dict]], dropped_fields: set[str]
+) -> None:
     rows = load_jsonl(src)
     if not rows:
         rows = [
@@ -216,7 +245,9 @@ def run_standardize_dataset(
     src_root = validate_dataset_root(src_root)
     info = load_json(src_root / "meta" / "info.json")
     data_version = _normalize_data_version(data_version, info.get("features") or {})
-    out_root = _prepare_output_root(src_root, out_root or default_standardize_path(src_root), dry_run, overwrite)
+    out_root = _prepare_output_root(
+        src_root, out_root or default_standardize_path(src_root), dry_run, overwrite
+    )
     paths = parquet_paths(src_root)
     if not paths:
         raise FileNotFoundError(f"No parquet files found under {src_root / 'data'}")
@@ -238,7 +269,13 @@ def run_standardize_dataset(
             "workers": worker_count,
         },
     )
-    emit(progress_callback, status="running", current=0, total=len(paths), message=f"Planning standardization: {result.summary}")
+    emit(
+        progress_callback,
+        status="running",
+        current=0,
+        total=len(paths),
+        message=f"Planning standardization: {result.summary}",
+    )
     if dry_run:
         emit(progress_callback, status="done", current=0, total=len(paths), message="Dry run complete")
         return result
@@ -251,22 +288,27 @@ def run_standardize_dataset(
     dropped_fields: set[str] = set()
     dims_after: dict[str, int] = {}
     tasks = [
-        (str(src), str(out_root / "data" / src.relative_to(src_root / "data")), data_version)
-        for src in paths
+        (str(src), str(out_root / "data" / src.relative_to(src_root / "data")), data_version) for src in paths
     ]
     if worker_count == 1:
         for idx, task in enumerate(tasks, start=1):
-            episode_index, stats, parquet_dropped, parquet_dims = _rewrite_parquet_worker(task)
-            stats_by_episode[episode_index] = stats
+            parquet_stats, parquet_dropped, parquet_dims = _rewrite_parquet_worker(task)
+            stats_by_episode.update(parquet_stats)
             dropped_fields.update(parquet_dropped)
             dims_after.update(parquet_dims)
-            emit(progress_callback, status="running", current=idx, total=len(paths), message=f"Standardized parquet {idx}/{len(paths)}")
+            emit(
+                progress_callback,
+                status="running",
+                current=idx,
+                total=len(paths),
+                message=f"Standardized parquet {idx}/{len(paths)}",
+            )
     else:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(_rewrite_parquet_worker, task) for task in tasks]
             for idx, future in enumerate(as_completed(futures), start=1):
-                episode_index, stats, parquet_dropped, parquet_dims = future.result()
-                stats_by_episode[episode_index] = stats
+                parquet_stats, parquet_dropped, parquet_dims = future.result()
+                stats_by_episode.update(parquet_stats)
                 dropped_fields.update(parquet_dropped)
                 dims_after.update(parquet_dims)
                 emit(
@@ -280,7 +322,17 @@ def run_standardize_dataset(
     result.summary["dropped_fields"] = sorted(dropped_fields)
     result.summary["dims_after"] = dims_after
     write_json(out_root / "meta" / "info.json", _update_info(info, dropped_fields))
-    _rewrite_stats(src_root / "meta" / "episodes_stats.jsonl", out_root / "meta" / "episodes_stats.jsonl", stats_by_episode, dropped_fields)
+    if is_v3_info(info):
+        _rewrite_v3_stats(out_root, stats_by_episode)
+        for field_name in dropped_fields:
+            _drop_field_from_v3_stats(out_root, field_name)
+    else:
+        _rewrite_stats(
+            src_root / "meta" / "episodes_stats.jsonl",
+            out_root / "meta" / "episodes_stats.jsonl",
+            stats_by_episode,
+            dropped_fields,
+        )
     write_json(
         out_root / "meta" / STANDARDIZE_META,
         {
@@ -294,5 +346,11 @@ def run_standardize_dataset(
             "created_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
-    emit(progress_callback, status="done", current=len(paths), total=len(paths), message=f"Standardization complete: {out_root}")
+    emit(
+        progress_callback,
+        status="done",
+        current=len(paths),
+        total=len(paths),
+        message=f"Standardization complete: {out_root}",
+    )
     return result

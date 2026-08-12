@@ -20,7 +20,6 @@ from lerobot.data_platform.precompute.preprocess.common import (
     write_json,
 )
 
-
 ACTION_COLUMN = "action"
 STATE_COLUMN = "state"
 
@@ -115,7 +114,9 @@ def _rewrite_parquet(src: Path, dst: Path, columns_to_trim: set[str], target_dim
             arrays.append(table[field.name])
             fields.append(field)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata=table.schema.metadata)), dst)
+    pq.write_table(
+        pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata=table.schema.metadata)), dst
+    )
 
 
 def _updated_info(info: dict, dims: dict[str, int], target_dim: int) -> dict:
@@ -154,6 +155,51 @@ def _trim_stats_file(src: Path, dst: Path, columns: set[str], target_dim: int) -
     return count
 
 
+def _trim_v3_stats(out_root: Path, columns: set[str], target_dim: int) -> None:
+    stats_path = out_root / "meta" / "stats.json"
+    if stats_path.is_file():
+        stats = load_json(stats_path)
+        for column in columns:
+            column_stats = stats.get(column)
+            if not isinstance(column_stats, dict):
+                continue
+            for key in ("min", "max", "mean", "std"):
+                if key in column_stats:
+                    column_stats[key] = _trim_value(column_stats[key], target_dim)
+        write_json(stats_path, stats)
+
+    for path in sorted((out_root / "meta" / "episodes").rglob("*.parquet")):
+        table = pq.read_table(path)
+        arrays = []
+        fields = []
+        stats_columns = {
+            f"stats/{column}/{stat_name}" for column in columns for stat_name in ("min", "max", "mean", "std")
+        }
+        for field in table.schema:
+            if field.name in stats_columns:
+                values = [_trim_value(value, target_dim) for value in table[field.name].to_pylist()]
+                target_type = _trim_arrow_type(field.type, target_dim)
+                arrays.append(pa.array(values, type=target_type))
+                fields.append(
+                    pa.field(
+                        field.name,
+                        target_type,
+                        nullable=field.nullable,
+                        metadata=field.metadata,
+                    )
+                )
+            else:
+                arrays.append(table[field.name])
+                fields.append(field)
+        pq.write_table(
+            pa.Table.from_arrays(
+                arrays,
+                schema=pa.schema(fields, metadata=table.schema.metadata),
+            ),
+            path,
+        )
+
+
 def run_convert_action(
     src_root: Path,
     out_root: Path | None = None,
@@ -162,7 +208,9 @@ def run_convert_action(
     progress_callback: ProgressCallback = None,
 ) -> PreprocessResult:
     src_root = validate_dataset_root(src_root)
-    out_root = ensure_output_root(out_root or default_preprocess_path(src_root, f"action{target_dim}"), dry_run)
+    out_root = ensure_output_root(
+        out_root or default_preprocess_path(src_root, f"action{target_dim}"), dry_run
+    )
     paths = parquet_paths(src_root)
     if not paths:
         raise FileNotFoundError(f"No parquet files found under {src_root / 'data'}")
@@ -184,7 +232,13 @@ def run_convert_action(
         dry_run=dry_run,
         summary={"observed_dims": dims, "trimmed_columns": sorted(columns_to_trim), "target_dim": target_dim},
     )
-    emit(progress_callback, status="running", current=0, total=len(paths), message=f"Planning action/state dim conversion: {result.summary}")
+    emit(
+        progress_callback,
+        status="running",
+        current=0,
+        total=len(paths),
+        message=f"Planning action/state dim conversion: {result.summary}",
+    )
     if dry_run:
         emit(progress_callback, status="done", current=0, total=len(paths), message="Dry run complete")
         return result
@@ -200,9 +254,27 @@ def run_convert_action(
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(src.read_bytes())
-        emit(progress_callback, status="running", current=idx, total=len(paths), message=f"Converted parquet {idx}/{len(paths)}")
+        emit(
+            progress_callback,
+            status="running",
+            current=idx,
+            total=len(paths),
+            message=f"Converted parquet {idx}/{len(paths)}",
+        )
 
     write_json(out_root / "meta" / "info.json", _updated_info(info, dims, target_dim))
-    _trim_stats_file(src_root / "meta" / "episodes_stats.jsonl", out_root / "meta" / "episodes_stats.jsonl", columns_to_trim, target_dim)
-    emit(progress_callback, status="done", current=len(paths), total=len(paths), message=f"Action/state conversion complete: {out_root}")
+    _trim_stats_file(
+        src_root / "meta" / "episodes_stats.jsonl",
+        out_root / "meta" / "episodes_stats.jsonl",
+        columns_to_trim,
+        target_dim,
+    )
+    _trim_v3_stats(out_root, columns_to_trim, target_dim)
+    emit(
+        progress_callback,
+        status="done",
+        current=len(paths),
+        total=len(paths),
+        message=f"Action/state conversion complete: {out_root}",
+    )
     return result

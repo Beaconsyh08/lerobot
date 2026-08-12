@@ -9,6 +9,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.data_platform.precompute.dataset_io import read_episode_table
 from lerobot.data_platform.precompute.timeseries import (
     BODY_JOINT_INDICES,
     DATA_VERSION_DVT1,
@@ -40,6 +41,7 @@ INITIAL_CLOSED_GRIPPER_OPEN_THRESHOLD = 0.1
 DVT2_STAGE4_STABLE_SECONDS = 0.4
 DVT2_PLACE_STAGE4_STABLE_SECONDS = 0.2
 DVT2_STAGE4_STABLE_THRESHOLD = 0.08
+DEFAULT_FALLBACK_STAGE_COUNT = 5
 QUALITY_FLAG_TYPE = "quality_flag"
 QUALITY_EARLY_WINDOW_SECONDS = 0.3
 QUALITY_GRIPPER_THRESHOLD = 0.5
@@ -157,7 +159,9 @@ def _initial_closed_gripper_open_frame(
     for gripper_idx in (7, 15):
         if gripper_idx >= state_data.shape[1] or state_data.shape[0] < 2:
             continue
-        series = np.asarray(state_data[: min(int(upper_bound), state_data.shape[0]), gripper_idx], dtype=np.float64)
+        series = np.asarray(
+            state_data[: min(int(upper_bound), state_data.shape[0]), gripper_idx], dtype=np.float64
+        )
         finite_indices = np.flatnonzero(np.isfinite(series))
         if finite_indices.size == 0:
             continue
@@ -292,17 +296,16 @@ def _stuck_closed_gripper_no_action_issues(
         state_closed_mask = state_finite > QUALITY_GRIPPER_THRESHOLD
         state_closed_ratio = float(np.mean(state_closed_mask))
         action_abs_max = float(np.max(np.abs(action_finite)))
-        if action_finite.size >= 2:
-            action_delta_max = float(np.max(np.abs(np.diff(action_finite))))
-        else:
-            action_delta_max = 0.0
+        action_delta_max = float(np.max(np.abs(np.diff(action_finite)))) if action_finite.size >= 2 else 0.0
 
         if (
             state_closed_ratio >= QUALITY_STUCK_CLOSED_RATIO
             and action_abs_max <= QUALITY_STUCK_ACTION_MAX_ABS
             and action_delta_max <= QUALITY_STUCK_ACTION_MAX_DELTA
         ):
-            closed_frames = np.where(np.isfinite(state_series) & (state_series > QUALITY_GRIPPER_THRESHOLD))[0]
+            closed_frames = np.where(np.isfinite(state_series) & (state_series > QUALITY_GRIPPER_THRESHOLD))[
+                0
+            ]
             issues.append(
                 {
                     "episode": int(episode_id),
@@ -371,7 +374,9 @@ def _state_gripper_transition_without_action_issues(
             window_end = min(frame_count - 1, frame + post_frames)
             matched = bool(
                 action_transition_frames.size
-                and np.any((action_transition_frames >= window_start) & (action_transition_frames <= window_end))
+                and np.any(
+                    (action_transition_frames >= window_start) & (action_transition_frames <= window_end)
+                )
             )
             if matched:
                 continue
@@ -474,7 +479,9 @@ def _joint_zero_reset_issues(
     frame_counts: dict[int, int] = {}
     for event in events:
         frame_counts[int(event["frame"])] = frame_counts.get(int(event["frame"]), 0) + 1
-    sync_frames = sorted(frame for frame, count in frame_counts.items() if count >= QUALITY_ZERO_RESET_MIN_SYNC_DIMS)
+    sync_frames = sorted(
+        frame for frame, count in frame_counts.items() if count >= QUALITY_ZERO_RESET_MIN_SYNC_DIMS
+    )
     affected_joints = sorted({(str(event["source"]), int(event["joint_index"])) for event in events})
     if not (
         len(events) >= QUALITY_ZERO_RESET_MIN_EVENTS
@@ -527,9 +534,15 @@ def compute_quality_flags(
     action_array = _safe_2d_float_array(action_data)
     state_array = _safe_2d_float_array(state_data)
 
-    action_norm = normalize_gripper_columns(action_array, "action", data_version) if action_array is not None else None
-    state_norm = normalize_gripper_columns(state_array, "state", data_version) if state_array is not None else None
-    all_gripper_events = _gripper_transition_frames(action_norm, "action") + _gripper_transition_frames(state_norm, "state")
+    action_norm = (
+        normalize_gripper_columns(action_array, "action", data_version) if action_array is not None else None
+    )
+    state_norm = (
+        normalize_gripper_columns(state_array, "state", data_version) if state_array is not None else None
+    )
+    all_gripper_events = _gripper_transition_frames(action_norm, "action") + _gripper_transition_frames(
+        state_norm, "state"
+    )
     early_gripper_events = [event for event in all_gripper_events if int(event["frame"]) < early_count]
     if early_gripper_events:
         issues.append(
@@ -656,6 +669,7 @@ def compute_subtask_boundaries(
     task: str = "",
     gripper_margin: float | None = None,
     data_version: str = DATA_VERSION_DVT1,
+    fallback_stage_count: int = DEFAULT_FALLBACK_STAGE_COUNT,
 ) -> tuple[dict | None, list[dict]]:
     """Auto-detect subtask stage boundaries."""
     issues: list[dict] = []
@@ -663,6 +677,33 @@ def compute_subtask_boundaries(
     if gripper_margin is None:
         gripper_margin = _gripper_stage_margin_seconds(data_version)
     num_frames = len(timestamps)
+    is_pick = "pick" in task.lower() if task else False
+    is_place = any(token in task.lower() for token in ("place", "put")) if task else False
+    is_give = ("give" in task.lower() or "hand" in task.lower()) if task else False
+
+    if not (is_pick or is_place or is_give):
+        fallback_stage_count = int(fallback_stage_count)
+        if fallback_stage_count < 2:
+            raise ValueError("fallback_stage_count must be at least 2")
+        if num_frames < 2:
+            msg = f"too few frames ({num_frames}) for time-equal stages"
+            logging.warning("Episode %d: %s, skipping annotation.", episode_id, msg)
+            issues.append({"episode": episode_id, "type": "error", "reason": msg})
+            return None, issues
+        start_time = float(timestamps[0])
+        end_time = float(timestamps[-1])
+        if not np.isfinite(start_time) or not np.isfinite(end_time) or end_time <= start_time:
+            msg = "timestamps must have a positive finite duration for time-equal stages"
+            logging.warning("Episode %d: %s, skipping annotation.", episode_id, msg)
+            issues.append({"episode": episode_id, "type": "error", "reason": msg})
+            return None, issues
+        stage_boundaries = np.linspace(start_time, end_time, fallback_stage_count + 1)[1:-1]
+        return {
+            "equal_time": True,
+            "num_stages": fallback_stage_count,
+            "stage_boundaries": [float(value) for value in stage_boundaries],
+        }, issues
+
     min_frames = 10
     if num_frames < min_frames * 5:
         msg = f"too few frames ({num_frames}) for 5 stages"
@@ -671,12 +712,11 @@ def compute_subtask_boundaries(
         return None, issues
 
     action_data = normalize_gripper_columns(action_data, "action", data_version)
-    state_data = normalize_gripper_columns(state_data, "state", data_version) if state_data is not None else None
+    state_data = (
+        normalize_gripper_columns(state_data, "state", data_version) if state_data is not None else None
+    )
     action_dim = action_data.shape[1]
     state_dim = state_data.shape[1] if state_data is not None else 0
-    is_pick = "pick" in task.lower() if task else False
-    is_place = any(token in task.lower() for token in ("place", "put")) if task else False
-    is_give = ("give" in task.lower() or "hand" in task.lower()) if task else False
 
     gripper_indices = [idx for idx in [7, 15] if idx < action_dim]
     all_transitions = []
@@ -725,7 +765,9 @@ def compute_subtask_boundaries(
             issues.append({"episode": episode_id, "type": "error", "reason": msg})
             return None, issues
 
-    initial_closed_to_open_count = _initial_closed_to_open_transition_count(all_transitions, action_data, state_data)
+    initial_closed_to_open_count = _initial_closed_to_open_transition_count(
+        all_transitions, action_data, state_data
+    )
     expected_transitions = (2 if is_give else 1) + initial_closed_to_open_count
     should_flag_multi_gripper = len(all_transitions) > expected_transitions
     if should_flag_multi_gripper:
@@ -903,6 +945,17 @@ def assign_subtask_states(timestamps, boundaries) -> list[int]:
     if boundaries is None:
         return [0] * len(timestamps)
 
+    if boundaries.get("equal_time"):
+        num_stages = int(boundaries["num_stages"])
+        stage_boundaries = np.asarray(boundaries["stage_boundaries"], dtype=np.float64)
+        return [
+            min(
+                int(np.searchsorted(stage_boundaries, float(timestamp), side="right")),
+                num_stages - 1,
+            )
+            for timestamp in timestamps
+        ]
+
     is_give = boundaries.get("is_give", False)
     direct_give = bool(boundaries.get("direct_give", False))
     result = []
@@ -945,6 +998,7 @@ def write_episode_csv(
     overwrite: bool,
     force_recompute_stage: bool = False,
     data_version: str = DATA_VERSION_DVT1,
+    fallback_stage_count: int = DEFAULT_FALLBACK_STAGE_COUNT,
 ) -> tuple[bool, dict | None, list[dict]]:
     """Write a precomputed CSV for one episode."""
     if out_path.exists() and not overwrite:
@@ -963,7 +1017,12 @@ def write_episode_csv(
     if use_existing_stage and "subtask_state" not in read_columns:
         read_columns.append("subtask_state")
 
-    data = pd.read_parquet(parquet_path, columns=read_columns)
+    data = read_episode_table(
+        dataset_root,
+        meta,
+        episode_id,
+        columns=read_columns,
+    ).to_pandas()
     if max_frames is not None:
         data = data.head(max_frames)
 
@@ -980,7 +1039,9 @@ def write_episode_csv(
         if action_dim > 0 and "action" in data.columns and len(data) > 1:
             fps = 1.0 / np.median(np.diff(data["timestamp"].values))
             action_array = series_to_2d(data["action"], action_dim)
-            state_array = series_to_2d(data["state"], state_dim) if state_dim > 0 and "state" in data.columns else None
+            state_array = (
+                series_to_2d(data["state"], state_dim) if state_dim > 0 and "state" in data.columns else None
+            )
             task = ""
             if hasattr(meta, "episodes") and episode_id in meta.episodes:
                 tasks = meta.episodes[episode_id].get("tasks", [])
@@ -993,6 +1054,7 @@ def write_episode_csv(
                 episode_id=episode_id,
                 task=task,
                 data_version=data_version,
+                fallback_stage_count=fallback_stage_count,
             )
 
     if downsample is not None and downsample > 1:
@@ -1051,7 +1113,8 @@ def write_episode_csv(
     elif boundaries is not None:
         states = assign_subtask_states(data["timestamp"].values, boundaries)
         header.append("stage")
-        max_stage = 5 if boundaries.get("is_give") else 4
+        num_stages = int(boundaries.get("num_stages", 6 if boundaries.get("is_give") else 5))
+        max_stage = num_stages - 1
         for row_idx, state in enumerate(states):
             rows[row_idx].append(state / float(max_stage))
 

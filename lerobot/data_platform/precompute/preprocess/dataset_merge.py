@@ -1,6 +1,7 @@
 import csv
 import json
 import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from pathlib import Path
@@ -22,6 +23,14 @@ from lerobot.data_platform.precompute.preprocess.common import (
     validate_dataset_root,
     write_json,
     write_jsonl,
+)
+from lerobot.data_platform.precompute.preprocess.dataset_version import (
+    DEFAULT_DATA_FILE_SIZE_IN_MB,
+    DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+    V30,
+    detect_dataset_version,
+    materialize_v21_from_v3,
+    run_convert_v3,
 )
 
 
@@ -53,7 +62,9 @@ def _validate_compatible(roots: list[Path], infos: list[dict]) -> None:
     base_features = base.get("features") or {}
     for root, info in zip(roots[1:], infos[1:], strict=False):
         if info.get("robot_type") != base.get("robot_type"):
-            raise ValueError(f"{root} robot_type={info.get('robot_type')} differs from {base.get('robot_type')}")
+            raise ValueError(
+                f"{root} robot_type={info.get('robot_type')} differs from {base.get('robot_type')}"
+            )
         if info.get("fps") != base.get("fps"):
             raise ValueError(f"{root} fps={info.get('fps')} differs from {base.get('fps')}")
         features = info.get("features") or {}
@@ -134,13 +145,17 @@ def _build_episode_map(
             new_idx = next_episode
             length = int(episode["length"])
             episode_map.append((root, old_idx, new_idx))
-            episodes_out.append({"episode_index": new_idx, "tasks": episode.get("tasks", []), "length": length})
+            episodes_out.append(
+                {"episode_index": new_idx, "tasks": episode.get("tasks", []), "length": length}
+            )
             if old_idx in stats:
                 row = dict(stats[old_idx])
                 row["episode_index"] = new_idx
                 stats_payload = row.get("stats") or {}
                 if "episode_index" in stats_payload:
-                    stats_payload["episode_index"].update({"min": [new_idx], "max": [new_idx], "mean": [float(new_idx)], "std": [0.0]})
+                    stats_payload["episode_index"].update(
+                        {"min": [new_idx], "max": [new_idx], "mean": [float(new_idx)], "std": [0.0]}
+                    )
                 if "index" in stats_payload:
                     stats_payload["index"].update(
                         {
@@ -292,7 +307,9 @@ def _copy_labeling_visuals(src_static: Path, out_static: Path, old_idx: int, new
     return copied
 
 
-def _copy_cached_csvs(src_static: Path, out_static: Path, old_idx: int, new_idx: int, frame_offset: int) -> int:
+def _copy_cached_csvs(
+    src_static: Path, out_static: Path, old_idx: int, new_idx: int, frame_offset: int
+) -> int:
     copied = 0
     csv_dir = Path(src_static) / "csv"
     if not csv_dir.is_dir():
@@ -400,7 +417,9 @@ def _merge_record_jsonl(
     return written
 
 
-def _merge_source_jsons(src_static_dirs: list[Path | None], out_static: Path, feature_dir: str, pattern: str) -> int:
+def _merge_source_jsons(
+    src_static_dirs: list[Path | None], out_static: Path, feature_dir: str, pattern: str
+) -> int:
     written = 0
     grouped: dict[str, list[dict]] = {}
     for src_static in src_static_dirs:
@@ -488,7 +507,13 @@ def _merge_annotation_issues(
             merged.append(updated)
     if not merged:
         return 0
-    merged.sort(key=lambda issue: (int(issue.get("episode", -1)), str(issue.get("type", "")), str(issue.get("reason", ""))))
+    merged.sort(
+        key=lambda issue: (
+            int(issue.get("episode", -1)),
+            str(issue.get("type", "")),
+            str(issue.get("reason", "")),
+        )
+    )
     _write_json_file(out_static / "annotation_issues.json", merged)
     return len(merged)
 
@@ -559,7 +584,9 @@ def _merge_pending_prompt_assignments(
     if not assignments:
         return 0
     assignments.sort(key=lambda item: int(item.get("episode_index", -1)))
-    _write_json_file(out_static / "prompt_assignments_pending.json", {"version": 1, "assignments": assignments})
+    _write_json_file(
+        out_static / "prompt_assignments_pending.json", {"version": 1, "assignments": assignments}
+    )
     return len(assignments)
 
 
@@ -590,13 +617,23 @@ def _merge_static_artifacts(
         src_static = src_dirs[src_pos] if src_pos < len(src_dirs) else None
         if src_static is None:
             continue
-        summary["csv_files"] += _copy_cached_csvs(src_static, out_static, old_idx, new_idx, frame_offsets[new_idx])
+        summary["csv_files"] += _copy_cached_csvs(
+            src_static, out_static, old_idx, new_idx, frame_offsets[new_idx]
+        )
         summary["video_files"] += _copy_cached_videos(src_static, out_static, old_idx, new_idx)
         summary["labeling_vis_files"] += _copy_labeling_visuals(src_static, out_static, old_idx, new_idx)
-    summary["labeling_jsonl_files"] += _merge_record_jsonl(src_dirs, out_static, episode_mapping, "labeling", "labels*.jsonl")
-    summary["labeling_jsonl_files"] += _merge_record_jsonl(src_dirs, out_static, episode_mapping, "labeling", "labels_reviewed*.jsonl")
-    summary["tagging_jsonl_files"] += _merge_record_jsonl(src_dirs, out_static, episode_mapping, "tagging", "tags*.jsonl")
-    summary["tagging_jsonl_files"] += _merge_record_jsonl(src_dirs, out_static, episode_mapping, "tagging", "tags_reviewed*.jsonl")
+    summary["labeling_jsonl_files"] += _merge_record_jsonl(
+        src_dirs, out_static, episode_mapping, "labeling", "labels*.jsonl"
+    )
+    summary["labeling_jsonl_files"] += _merge_record_jsonl(
+        src_dirs, out_static, episode_mapping, "labeling", "labels_reviewed*.jsonl"
+    )
+    summary["tagging_jsonl_files"] += _merge_record_jsonl(
+        src_dirs, out_static, episode_mapping, "tagging", "tags*.jsonl"
+    )
+    summary["tagging_jsonl_files"] += _merge_record_jsonl(
+        src_dirs, out_static, episode_mapping, "tagging", "tags_reviewed*.jsonl"
+    )
     summary["source_json_files"] += _merge_source_jsons(src_dirs, out_static, "labeling", "source*.json")
     summary["source_json_files"] += _merge_source_jsons(src_dirs, out_static, "tagging", "source*.json")
     summary["flag_json_files"] = _merge_flag_jsons(src_dirs, out_static, episode_mapping)
@@ -607,7 +644,9 @@ def _merge_static_artifacts(
         episode_mapping,
         ["trim_annotations.json", "subtask_annotations.json"],
     )
-    summary["pending_prompt_assignments"] = _merge_pending_prompt_assignments(src_dirs, out_static, episode_mapping)
+    summary["pending_prompt_assignments"] = _merge_pending_prompt_assignments(
+        src_dirs, out_static, episode_mapping
+    )
     return summary
 
 
@@ -632,6 +671,67 @@ def run_merge(
         raise ValueError("merge requires at least two source datasets")
     out_root = ensure_output_root(out_root or default_preprocess_path(roots[0], _default_op), dry_run)
     infos = [load_json(root / "meta" / "info.json") for root in roots]
+    v3_positions = [position for position, root in enumerate(roots) if detect_dataset_version(root) == V30]
+    if v3_positions:
+        source_info = infos[v3_positions[0]]
+        with tempfile.TemporaryDirectory(
+            prefix=f".lerobot-v3-{_op}-",
+            dir=out_root.parent,
+        ) as temp_dir:
+            temp_root = Path(temp_dir)
+            legacy_roots = list(roots)
+            for position in v3_positions:
+                legacy_roots[position] = materialize_v21_from_v3(
+                    roots[position],
+                    temp_root / f"source_{position:03d}",
+                    include_data=True,
+                    include_videos=not dry_run,
+                    workers=max(1, int(workers or 1)),
+                    progress_callback=progress_callback,
+                )
+            legacy_output = temp_root / "output"
+            legacy_result = run_merge(
+                legacy_roots,
+                out_root=legacy_output,
+                dry_run=dry_run,
+                src_static_dirs=src_static_dirs,
+                out_static_dir=out_static_dir,
+                workers=workers,
+                exclude_episodes=exclude_episodes,
+                progress_callback=progress_callback,
+                _allow_single_source=_allow_single_source,
+                _op=_op,
+                _default_op=_default_op,
+                _summary_extra=_summary_extra,
+            )
+            summary = {
+                **legacy_result.summary,
+                "source_formats": [detect_dataset_version(root) for root in roots],
+                "output_format": V30,
+            }
+            if not dry_run:
+                run_convert_v3(
+                    legacy_output,
+                    out_root,
+                    data_file_size_in_mb=int(
+                        source_info.get("data_files_size_in_mb") or DEFAULT_DATA_FILE_SIZE_IN_MB
+                    ),
+                    video_file_size_in_mb=int(
+                        source_info.get("video_files_size_in_mb") or DEFAULT_VIDEO_FILE_SIZE_IN_MB
+                    ),
+                    workers=max(1, int(workers or 1)),
+                    progress_callback=progress_callback,
+                )
+            return PreprocessResult(
+                op=_op,
+                src_roots=roots,
+                out_root=out_root,
+                repo_id=f"local/{out_root.name}",
+                total_episodes=legacy_result.total_episodes,
+                total_frames=legacy_result.total_frames,
+                dry_run=dry_run,
+                summary=summary,
+            )
     _validate_compatible(roots, infos)
     merged_features = _merge_features(infos)
     merged_tasks, task_maps = _build_task_map(roots)
@@ -640,7 +740,9 @@ def run_merge(
     if not raw_episode_map:
         raise ValueError(f"{_op} produced no episodes; source datasets may have empty meta/episodes.jsonl")
     root_positions = {str(root): idx for idx, root in enumerate(roots)}
-    episode_map = [(root_positions[str(root)], root, old_idx, new_idx) for root, old_idx, new_idx in raw_episode_map]
+    episode_map = [
+        (root_positions[str(root)], root, old_idx, new_idx) for root, old_idx, new_idx in raw_episode_map
+    ]
     arrow_fields = _collect_arrow_fields(raw_episode_map, roots, infos, merged_features)
     worker_count = max(1, int(workers or 1))
     result = PreprocessResult(
@@ -656,11 +758,19 @@ def run_merge(
             "episodes": len(episodes_out),
             "tasks": len(merged_tasks),
             "workers": worker_count,
-            "deleted_source_episodes": {str(root): sorted(values) for root, values in exclude_by_root.items()},
+            "deleted_source_episodes": {
+                str(root): sorted(values) for root, values in exclude_by_root.items()
+            },
             **(_summary_extra or {}),
         },
     )
-    emit(progress_callback, status="running", current=0, total=len(episode_map), message=f"Planning {_op}: {result.summary}")
+    emit(
+        progress_callback,
+        status="running",
+        current=0,
+        total=len(episode_map),
+        message=f"Planning {_op}: {result.summary}",
+    )
     if dry_run:
         emit(progress_callback, status="done", current=0, total=len(episode_map), message="Dry run complete")
         return result
@@ -694,7 +804,13 @@ def run_merge(
                     merged_features=merged_features,
                     arrow_fields=arrow_fields,
                 )
-                emit(progress_callback, status="running", current=idx, total=len(episode_map), message=f"Merged episode {old_idx} -> {new_idx}")
+                emit(
+                    progress_callback,
+                    status="running",
+                    current=idx,
+                    total=len(episode_map),
+                    message=f"Merged episode {old_idx} -> {new_idx}",
+                )
         else:
             with ThreadPoolExecutor(max_workers=min(worker_count, len(episode_map))) as executor:
                 futures = {
@@ -725,17 +841,31 @@ def run_merge(
 
         written_parquets = list((out_root / "data").rglob("*.parquet"))
         if len(written_parquets) != len(episode_map):
-            raise RuntimeError(f"{_op} wrote {len(written_parquets)} parquet files, expected {len(episode_map)}")
+            raise RuntimeError(
+                f"{_op} wrote {len(written_parquets)} parquet files, expected {len(episode_map)}"
+            )
 
-        copy_episode_videos([(src_root, old_idx, new_idx) for _src_pos, src_root, old_idx, new_idx in episode_map], info, out_root)
+        copy_episode_videos(
+            [(src_root, old_idx, new_idx) for _src_pos, src_root, old_idx, new_idx in episode_map],
+            info,
+            out_root,
+        )
         if out_static_dir is None and src_static_dirs:
             out_static_dir = out_root.parent / "vis" / f"local_vis_{out_root.name}" / "static"
-        artifact_summary = _merge_static_artifacts(episode_map, frame_offsets, src_static_dirs, out_static_dir)
+        artifact_summary = _merge_static_artifacts(
+            episode_map, frame_offsets, src_static_dirs, out_static_dir
+        )
         if artifact_summary:
             result.summary["artifacts"] = artifact_summary
     except Exception:
         if out_root.exists():
             shutil.rmtree(out_root, ignore_errors=True)
         raise
-    emit(progress_callback, status="done", current=len(episode_map), total=len(episode_map), message=f"{_op.title()} complete: {out_root}")
+    emit(
+        progress_callback,
+        status="done",
+        current=len(episode_map),
+        total=len(episode_map),
+        message=f"{_op.title()} complete: {out_root}",
+    )
     return result

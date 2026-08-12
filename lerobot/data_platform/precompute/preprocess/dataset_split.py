@@ -1,3 +1,4 @@
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +17,15 @@ from lerobot.data_platform.precompute.preprocess.common import (
     validate_dataset_root,
     write_json,
     write_jsonl,
+)
+from lerobot.data_platform.precompute.preprocess.dataset_version import (
+    DEFAULT_DATA_FILE_SIZE_IN_MB,
+    DEFAULT_V3_CONVERT_WORKERS,
+    DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+    V30,
+    detect_dataset_version,
+    materialize_v21_from_v3,
+    run_convert_v3,
 )
 
 
@@ -81,7 +91,9 @@ def _build_tasks(selected: list[dict], tasks: list[dict]) -> tuple[list[dict], d
     return new_tasks, old_to_new
 
 
-def _build_episode_records(selected: list[dict], stats: list[dict]) -> tuple[list[tuple[int, int]], list[dict], list[dict], int]:
+def _build_episode_records(
+    selected: list[dict], stats: list[dict]
+) -> tuple[list[tuple[int, int]], list[dict], list[dict], int]:
     stats_by_idx = {int(row["episode_index"]): row for row in stats}
     mapping = []
     new_episodes = []
@@ -97,7 +109,9 @@ def _build_episode_records(selected: list[dict], stats: list[dict]) -> tuple[lis
             row["episode_index"] = new_idx
             stats_payload = row.get("stats") or {}
             if "episode_index" in stats_payload:
-                stats_payload["episode_index"].update({"min": [new_idx], "max": [new_idx], "mean": [float(new_idx)], "std": [0.0]})
+                stats_payload["episode_index"].update(
+                    {"min": [new_idx], "max": [new_idx], "mean": [float(new_idx)], "std": [0.0]}
+                )
             if "index" in stats_payload:
                 stats_payload["index"].update(
                     {
@@ -121,6 +135,58 @@ def run_split(
 ) -> PreprocessResult:
     src_root = validate_dataset_root(src_root)
     out_root = ensure_output_root(out_root or default_preprocess_path(src_root, "split"), dry_run)
+    if detect_dataset_version(src_root) == V30:
+        source_info = load_json(src_root / "meta" / "info.json")
+        with tempfile.TemporaryDirectory(
+            prefix=".lerobot-v3-split-",
+            dir=out_root.parent,
+        ) as temp_dir:
+            temp_root = Path(temp_dir)
+            legacy_source = materialize_v21_from_v3(
+                src_root,
+                temp_root / "source",
+                include_data=not dry_run,
+                include_videos=not dry_run,
+                workers=DEFAULT_V3_CONVERT_WORKERS,
+                progress_callback=progress_callback,
+            )
+            legacy_output = temp_root / "output"
+            legacy_result = run_split(
+                legacy_source,
+                legacy_output,
+                episode_range=episode_range,
+                task_filter=task_filter,
+                dry_run=dry_run,
+                progress_callback=progress_callback,
+            )
+            summary = {
+                **legacy_result.summary,
+                "source_format": V30,
+                "output_format": V30,
+            }
+            if not dry_run:
+                run_convert_v3(
+                    legacy_output,
+                    out_root,
+                    data_file_size_in_mb=int(
+                        source_info.get("data_files_size_in_mb") or DEFAULT_DATA_FILE_SIZE_IN_MB
+                    ),
+                    video_file_size_in_mb=int(
+                        source_info.get("video_files_size_in_mb") or DEFAULT_VIDEO_FILE_SIZE_IN_MB
+                    ),
+                    workers=DEFAULT_V3_CONVERT_WORKERS,
+                    progress_callback=progress_callback,
+                )
+            return PreprocessResult(
+                op="split",
+                src_roots=[src_root],
+                out_root=out_root,
+                repo_id=f"local/{out_root.name}",
+                total_episodes=legacy_result.total_episodes,
+                total_frames=legacy_result.total_frames,
+                dry_run=dry_run,
+                summary=summary,
+            )
     info = load_json(src_root / "meta" / "info.json")
     episodes = load_jsonl(src_root / "meta" / "episodes.jsonl")
     tasks = load_jsonl(src_root / "meta" / "tasks.jsonl")
@@ -142,12 +208,21 @@ def run_split(
         dry_run=dry_run,
         summary={"selected_episodes": len(new_episodes), "tasks": len(new_tasks)},
     )
-    emit(progress_callback, status="running", current=0, total=len(mapping), message=f"Planning split: {result.summary}")
+    emit(
+        progress_callback,
+        status="running",
+        current=0,
+        total=len(mapping),
+        message=f"Planning split: {result.summary}",
+    )
     if dry_run:
         emit(progress_callback, status="done", current=0, total=len(mapping), message="Dry run complete")
         return result
 
-    write_json(out_root / "meta" / "info.json", update_info_counts(info, len(new_episodes), total_frames, len(new_tasks)))
+    write_json(
+        out_root / "meta" / "info.json",
+        update_info_counts(info, len(new_episodes), total_frames, len(new_tasks)),
+    )
     write_jsonl(out_root / "meta" / "tasks.jsonl", new_tasks)
     write_jsonl(out_root / "meta" / "episodes.jsonl", new_episodes)
     write_jsonl(out_root / "meta" / "episodes_stats.jsonl", new_stats)
@@ -169,8 +244,20 @@ def run_split(
             df["index"] = frame_offset + df["frame_index"]
         dst.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(dst, index=False)
-        emit(progress_callback, status="running", current=idx, total=len(mapping), message=f"Split episode {old_idx} -> {new_idx}")
+        emit(
+            progress_callback,
+            status="running",
+            current=idx,
+            total=len(mapping),
+            message=f"Split episode {old_idx} -> {new_idx}",
+        )
 
     copy_episode_videos([(src_root, old_idx, new_idx) for old_idx, new_idx in mapping], info, out_root)
-    emit(progress_callback, status="done", current=len(mapping), total=len(mapping), message=f"Split complete: {out_root}")
+    emit(
+        progress_callback,
+        status="done",
+        current=len(mapping),
+        total=len(mapping),
+        message=f"Split complete: {out_root}",
+    )
     return result

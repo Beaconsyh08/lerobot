@@ -1,3 +1,4 @@
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,9 @@ class RouteContext:
     active_tag_variant: Callable[[Path, str | None], str | None]
     meta_only_dataset_cls: type
     append_operation_log: Callable[..., None] | None = None
+    audit_job: Callable[[dict, str, Exception | None], None] | None = None
     clear_dataset_caches: Callable[[tuple[str, str] | None], None] | None = None
+    refresh_dataset_after_episode_delete: Callable[[tuple[str, str], object, Path], list[int]] | None = None
     static_dir_for_key: Callable[[tuple[str, str]], Path | None] | None = None
 
     def update_job(self, job: dict, payload: dict) -> None:
@@ -70,6 +73,11 @@ class RouteContext:
             job["eta_seconds"] = eta_seconds
             job["updated_at"] = finished_at
             self.append_job_log(job, message)
+        if self.audit_job is not None:
+            try:
+                self.audit_job(job, "success", None)
+            except Exception:
+                logging.exception("Failed to record successful job audit")
 
     def fail_job(self, job: dict, message: str, exc: Exception) -> None:
         with self.jobs_lock:
@@ -83,6 +91,11 @@ class RouteContext:
             job["eta_seconds"] = eta_seconds
             job["updated_at"] = finished_at
             self.append_job_log(job, f"Error: {exc}")
+        if self.audit_job is not None:
+            try:
+                self.audit_job(job, "failed", exc)
+            except Exception:
+                logging.exception("Failed to record failed job audit")
 
     def invalidate_tagging_status(self, dataset_key: tuple[str, str], ds_static: Path) -> None:
         self.tagging_status_cache.pop(

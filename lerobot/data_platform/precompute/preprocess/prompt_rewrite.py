@@ -7,18 +7,23 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.dataset_io import (
+    V3DatasetMetadata,
+    is_v3_dataset,
+    load_episode_records,
+    load_task_records,
+    write_episode_records,
+    write_task_records,
+)
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
     ProgressCallback,
     emit,
     format_data_path,
     load_json,
-    load_jsonl,
     validate_dataset_root,
     write_json,
-    write_jsonl,
 )
-
 
 DEFAULT_PROMPT_PATTERN = r"\bpick up the (.+?) to the (left|right)\b"
 DEFAULT_PROMPT_REPLACEMENT = r"pick up the \1 on the \2"
@@ -69,11 +74,15 @@ def _backup_metadata(root: Path) -> dict[str, str]:
     backup_dir = root / "meta" / "prompt_rewrite_backups" / datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir.mkdir(parents=True, exist_ok=True)
     backups = {}
-    for name in ("tasks.jsonl", "episodes.jsonl"):
+    names = ("tasks.parquet", "episodes") if is_v3_dataset(root) else ("tasks.jsonl", "episodes.jsonl")
+    for name in names:
         src = root / "meta" / name
-        if src.is_file():
+        if src.exists():
             dst = backup_dir / name
-            shutil.copy2(src, dst)
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
             backups[name] = str(dst)
     return backups
 
@@ -143,12 +152,14 @@ def _remap_parquet_task_indices(
 
     changed_files = 0
     changed_values = 0
-    for row in episode_rows:
-        try:
-            episode_index = int(row["episode_index"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        parquet_path = root / format_data_path(info, episode_index)
+    if is_v3_dataset(root):
+        meta = V3DatasetMetadata(f"local/{root.name}", root)
+        parquet_paths = sorted(
+            {root / meta.get_data_file_path(int(row["episode_index"])) for row in episode_rows}
+        )
+    else:
+        parquet_paths = [root / format_data_path(info, int(row["episode_index"])) for row in episode_rows]
+    for parquet_path in parquet_paths:
         if not parquet_path.is_file():
             continue
         schema = pq.read_schema(parquet_path)
@@ -197,10 +208,8 @@ def run_rewrite_prompts(
     root = validate_dataset_root(root)
     compiled = re.compile(pattern)
     info = load_json(root / "meta" / "info.json")
-    tasks_path = root / "meta" / "tasks.jsonl"
-    episodes_path = root / "meta" / "episodes.jsonl"
-    task_rows = load_jsonl(tasks_path)
-    episode_rows = load_jsonl(episodes_path)
+    task_rows = load_task_records(root)
+    episode_rows = load_episode_records(root)
 
     emit(progress_callback, status="running", current=0, total=3, message="Scanning prompt metadata")
     changed_task_rows = 0
@@ -239,7 +248,14 @@ def run_rewrite_prompts(
                 changed_episode_task_values += 1
                 total_replacements += count
                 if len(preview) < 20:
-                    preview.append({"kind": "episodes", "episode_index": row.get("episode_index"), "from": task, "to": new_task})
+                    preview.append(
+                        {
+                            "kind": "episodes",
+                            "episode_index": row.get("episode_index"),
+                            "from": task,
+                            "to": new_task,
+                        }
+                    )
             new_tasks.append(new_task)
         if changed_this_episode:
             changed_episode_rows += 1
@@ -266,7 +282,13 @@ def run_rewrite_prompts(
         summary=summary,
     )
     if dry_run:
-        emit(progress_callback, status="done", current=3, total=3, message=f"Dry run complete: {total_replacements} replacements")
+        emit(
+            progress_callback,
+            status="done",
+            current=3,
+            total=3,
+            message=f"Dry run complete: {total_replacements} replacements",
+        )
         return result
 
     backups = _backup_metadata(root) if backup else {}
@@ -274,10 +296,16 @@ def run_rewrite_prompts(
         summary["backups"] = backups
     emit(progress_callback, status="running", current=2, total=3, message="Writing prompt metadata")
     if changed_task_rows:
-        write_jsonl(tasks_path, new_task_rows)
+        write_task_records(root, new_task_rows)
     if changed_episode_rows:
-        write_jsonl(episodes_path, new_episode_rows)
-    emit(progress_callback, status="done", current=3, total=3, message=f"Prompt rewrite complete: {total_replacements} replacements")
+        write_episode_records(root, new_episode_rows)
+    emit(
+        progress_callback,
+        status="done",
+        current=3,
+        total=3,
+        message=f"Prompt rewrite complete: {total_replacements} replacements",
+    )
     return result
 
 
@@ -289,10 +317,8 @@ def run_fix_prompt_prepositions(
 ) -> PreprocessResult:
     root = validate_dataset_root(root)
     info = load_json(root / "meta" / "info.json")
-    tasks_path = root / "meta" / "tasks.jsonl"
-    episodes_path = root / "meta" / "episodes.jsonl"
-    task_rows = load_jsonl(tasks_path)
-    episode_rows = load_jsonl(episodes_path)
+    task_rows = load_task_records(root)
+    episode_rows = load_episode_records(root)
 
     emit(progress_callback, status="running", current=0, total=3, message="Scanning prompt prepositions")
     changed_task_rows = 0
@@ -331,7 +357,14 @@ def run_fix_prompt_prepositions(
                 changed_episode_task_values += 1
                 total_replacements += count
                 if len(preview) < 20:
-                    preview.append({"kind": "episodes", "episode_index": row.get("episode_index"), "from": task, "to": new_task})
+                    preview.append(
+                        {
+                            "kind": "episodes",
+                            "episode_index": row.get("episode_index"),
+                            "from": task,
+                            "to": new_task,
+                        }
+                    )
             new_tasks.append(new_task)
         if changed_this_episode:
             changed_episode_rows += 1
@@ -356,7 +389,13 @@ def run_fix_prompt_prepositions(
         summary=summary,
     )
     if dry_run:
-        emit(progress_callback, status="done", current=3, total=3, message=f"Dry run complete: {total_replacements} prompt fixes")
+        emit(
+            progress_callback,
+            status="done",
+            current=3,
+            total=3,
+            message=f"Dry run complete: {total_replacements} prompt fixes",
+        )
         return result
 
     backups = _backup_metadata(root) if backup else {}
@@ -364,10 +403,16 @@ def run_fix_prompt_prepositions(
         summary["backups"] = backups
     emit(progress_callback, status="running", current=2, total=3, message="Writing prompt metadata")
     if changed_task_rows:
-        write_jsonl(tasks_path, new_task_rows)
+        write_task_records(root, new_task_rows)
     if changed_episode_rows:
-        write_jsonl(episodes_path, new_episode_rows)
-    emit(progress_callback, status="done", current=3, total=3, message=f"Prompt preposition fix complete: {total_replacements} fixes")
+        write_episode_records(root, new_episode_rows)
+    emit(
+        progress_callback,
+        status="done",
+        current=3,
+        total=3,
+        message=f"Prompt preposition fix complete: {total_replacements} fixes",
+    )
     return result
 
 
@@ -381,10 +426,8 @@ def run_lowercase_prompts(
     root = validate_dataset_root(root)
     info = load_json(root / "meta" / "info.json")
     info_path = root / "meta" / "info.json"
-    tasks_path = root / "meta" / "tasks.jsonl"
-    episodes_path = root / "meta" / "episodes.jsonl"
-    task_rows = load_jsonl(tasks_path)
-    episode_rows = load_jsonl(episodes_path)
+    task_rows = load_task_records(root)
+    episode_rows = load_episode_records(root)
 
     emit(progress_callback, status="running", current=0, total=4, message="Scanning prompt case")
     changed_task_rows = 0
@@ -440,7 +483,14 @@ def run_lowercase_prompts(
                 changed_episode_task_values += 1
                 total_replacements += count
                 if len(preview) < 20:
-                    preview.append({"kind": "episodes", "episode_index": row.get("episode_index"), "from": task, "to": new_task})
+                    preview.append(
+                        {
+                            "kind": "episodes",
+                            "episode_index": row.get("episode_index"),
+                            "from": task,
+                            "to": new_task,
+                        }
+                    )
             new_tasks.append(new_task)
         if changed_this_episode:
             changed_episode_rows += 1
@@ -454,7 +504,9 @@ def run_lowercase_prompts(
     total_replacements += pending_prompt_assignments_changed
     preview.extend(pending_preview[: max(0, 20 - len(preview))])
 
-    emit(progress_callback, status="running", current=2, total=4, message="Scanning parquet task_index columns")
+    emit(
+        progress_callback, status="running", current=2, total=4, message="Scanning parquet task_index columns"
+    )
     parquet_task_index_files_changed, parquet_task_index_values_changed = _remap_parquet_task_indices(
         root,
         info,
@@ -485,22 +537,40 @@ def run_lowercase_prompts(
         summary=summary,
     )
     if dry_run:
-        emit(progress_callback, status="done", current=4, total=4, message=f"Dry run complete: {total_replacements} prompt case changes")
+        emit(
+            progress_callback,
+            status="done",
+            current=4,
+            total=4,
+            message=f"Dry run complete: {total_replacements} prompt case changes",
+        )
         return result
 
     backups = _backup_metadata(root) if backup else {}
     if backups:
         summary["backups"] = backups
-    emit(progress_callback, status="running", current=3, total=4, message="Writing prompt metadata and task_index remap")
+    emit(
+        progress_callback,
+        status="running",
+        current=3,
+        total=4,
+        message="Writing prompt metadata and task_index remap",
+    )
     if changed_task_rows or removed_duplicate_task_rows:
-        write_jsonl(tasks_path, new_task_rows)
+        write_task_records(root, new_task_rows)
         info["total_tasks"] = len(new_task_rows)
         write_json(info_path, info)
     if changed_episode_rows:
-        write_jsonl(episodes_path, new_episode_rows)
+        write_episode_records(root, new_episode_rows)
     if pending_prompt_assignments_changed:
         _lowercase_pending_prompt_assignments(static_dir, dry_run=False)
     if parquet_task_index_files_changed:
         _remap_parquet_task_indices(root, info, episode_rows, old_to_new_task_index, dry_run=False)
-    emit(progress_callback, status="done", current=4, total=4, message=f"Prompt lowercase complete: {total_replacements} changes")
+    emit(
+        progress_callback,
+        status="done",
+        current=4,
+        total=4,
+        message=f"Prompt lowercase complete: {total_replacements} changes",
+    )
     return result

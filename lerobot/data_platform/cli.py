@@ -19,26 +19,28 @@ import argparse
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from tqdm.auto import tqdm
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.data_platform.precompute.annotation import write_episode_csv
-from lerobot.data_platform.precompute.timeseries import (
-    DATA_VERSION_DVT1,
-    DATA_VERSION_DVT2,
-    infer_data_version_from_features,
+from lerobot.common.utils.utils import init_logging
+from lerobot.data_platform.operation_log import audit_cli_main
+from lerobot.data_platform.precompute.annotation import (
+    DEFAULT_FALLBACK_STAGE_COUNT,
+    write_episode_csv,
 )
+from lerobot.data_platform.precompute.compare import CompareResult, run_compare_build
 from lerobot.data_platform.precompute.construction import (
     ConstructionResult,
     default_synthetic_path,
     run_construction,
 )
-from lerobot.data_platform.precompute.compare import CompareResult, run_compare_build
+from lerobot.data_platform.precompute.dataset_io import V3DatasetMetadata, is_v3_dataset
 from lerobot.data_platform.precompute.embedding import EmbeddingResult, run_embedding
 from lerobot.data_platform.precompute.labeling import (
     DEFAULT_BACKEND,
@@ -62,12 +64,18 @@ from lerobot.data_platform.precompute.mutations import (
     write_subtask_text_to_parquet,
 )
 from lerobot.data_platform.precompute.preprocess import (
+    DEFAULT_V3_CONVERT_WORKERS,
+    IMAGE_VIDEO_MODE_LEROBOT_OFFICIAL,
+    IMAGE_VIDEO_MODES,
+    default_v3_path,
+    repair_v3_video_timestamps,
     run_convert_action,
+    run_convert_v3,
     run_drop_field,
     run_merge,
     run_smooth_action,
-    run_standardize_dataset,
     run_split,
+    run_standardize_dataset,
     run_subtract,
 )
 from lerobot.data_platform.precompute.tagging import (
@@ -77,9 +85,14 @@ from lerobot.data_platform.precompute.tagging import (
     merge_tags_to_metadata,
     run_tagging,
 )
+from lerobot.data_platform.precompute.timeseries import (
+    DATA_VERSION_DVT1,
+    DATA_VERSION_DVT2,
+    infer_data_version_from_features,
+)
+from lerobot.data_platform.precompute.v3_viewer import run_v3_viewer_precompute
 from lerobot.data_platform.precompute.video import encode_episode_video
 from lerobot.data_platform.precompute.viewer_manifest import write_viewer_manifest
-from lerobot.common.utils.utils import init_logging
 
 
 @dataclass
@@ -114,6 +127,13 @@ def infer_data_version_from_root(root: Path) -> str:
     except (OSError, json.JSONDecodeError):
         return DATA_VERSION_DVT1
     return infer_data_version_from_features(info.get("features") or {})
+
+
+def load_platform_metadata(root: Path, repo_id: str):
+    root = Path(root)
+    if is_v3_dataset(root):
+        return V3DatasetMetadata(repo_id, root)
+    return LeRobotDatasetMetadata(repo_id, root=root)
 
 
 def _all_precomputed_files_exist(
@@ -172,7 +192,9 @@ def _is_precompute_issue(issue: dict) -> bool:
     return isinstance(issue, dict) and issue.get("type") in {"error", "multi_gripper"}
 
 
-def _write_annotation_issues(static_dir: Path, all_issues: list[dict], scanned_episodes: list[int] | None = None) -> None:
+def _write_annotation_issues(
+    static_dir: Path, all_issues: list[dict], scanned_episodes: list[int] | None = None
+) -> None:
     issues_path = static_dir / "annotation_issues.json"
     existing_issues = []
     if issues_path.is_file():
@@ -181,7 +203,7 @@ def _write_annotation_issues(static_dir: Path, all_issues: list[dict], scanned_e
             existing_issues = loaded if isinstance(loaded, list) else []
         except (json.JSONDecodeError, OSError):
             existing_issues = []
-    scanned = set(int(ep) for ep in scanned_episodes) if scanned_episodes is not None else None
+    scanned = {int(ep) for ep in scanned_episodes} if scanned_episodes is not None else None
     retained_issues = []
     for issue in existing_issues:
         if not isinstance(issue, dict):
@@ -192,7 +214,11 @@ def _write_annotation_issues(static_dir: Path, all_issues: list[dict], scanned_e
         retained_issues.append(issue)
     merged_issues = retained_issues + sorted(
         all_issues,
-        key=lambda issue: (int(issue.get("episode", -1)), str(issue.get("type", "")), str(issue.get("reason", ""))),
+        key=lambda issue: (
+            int(issue.get("episode", -1)),
+            str(issue.get("type", "")),
+            str(issue.get("reason", "")),
+        ),
     )
     issues_path.write_text(json.dumps(merged_issues, indent=2))
     if all_issues:
@@ -205,7 +231,11 @@ def _write_annotation_issues(static_dir: Path, all_issues: list[dict], scanned_e
             sum(1 for issue in all_issues if issue["type"] == "multi_gripper"),
         )
     else:
-        logging.info("No precompute annotation issues for scanned episodes — retained %d existing issues in %s", len(retained_issues), issues_path)
+        logging.info(
+            "No precompute annotation issues for scanned episodes — retained %d existing issues in %s",
+            len(retained_issues),
+            issues_path,
+        )
 
 
 def _write_subtask_annotations(
@@ -223,20 +253,29 @@ def _write_subtask_annotations(
 
     for episode_key, bounds in all_boundaries.items():
         if overwrite_csv or episode_key not in existing:
-            if bounds.get("direct_give"):
+            if bounds.get("equal_time"):
+                transitions = [
+                    {"time": boundary_time, "state": stage_index}
+                    for stage_index, boundary_time in enumerate(
+                        bounds["stage_boundaries"],
+                        start=1,
+                    )
+                ]
+            elif bounds.get("direct_give"):
                 transitions = [{"time": bounds["stage0_end"], "state": 3}]
             else:
                 transitions = [{"time": bounds["stage0_end"], "state": 1}]
-            if "stage2_start" in bounds and "stage2_end" in bounds:
-                transitions.extend(
-                    [
-                        {"time": bounds["stage2_start"], "state": 2},
-                        {"time": bounds["stage2_end"], "state": 3},
-                    ]
-                )
-            transitions.append({"time": bounds["stage4_start"], "state": 4})
-            if bounds.get("is_give"):
-                transitions.append({"time": bounds["stage4_end"], "state": 5})
+            if not bounds.get("equal_time"):
+                if "stage2_start" in bounds and "stage2_end" in bounds:
+                    transitions.extend(
+                        [
+                            {"time": bounds["stage2_start"], "state": 2},
+                            {"time": bounds["stage2_end"], "state": 3},
+                        ]
+                    )
+                transitions.append({"time": bounds["stage4_start"], "state": 4})
+                if bounds.get("is_give"):
+                    transitions.append({"time": bounds["stage4_end"], "state": 5})
             existing[episode_key] = transitions
 
     ann_path.write_text(json.dumps(existing, indent=2))
@@ -270,6 +309,7 @@ def run_precompute(
     annotate: bool = False,
     write_parquet: bool = False,
     force_recompute_stage: bool = False,
+    fallback_stage_count: int = DEFAULT_FALLBACK_STAGE_COUNT,
     write_subtask: bool = False,
     overwrite_parquet: bool = False,
     overwrite_subtask_text: bool = False,
@@ -324,17 +364,25 @@ def run_precompute(
         raise FileNotFoundError(f"Missing dataset metadata at: {info_path}")
 
     repo_id = repo_id or f"local/{root.name or 'dataset'}"
-    meta = LeRobotDatasetMetadata(repo_id, root=root)
+    source_is_v3 = is_v3_dataset(root)
+    meta = load_platform_metadata(root, repo_id)
     data_version = str(data_version or infer_data_version_from_features(meta.features)).upper()
     if data_version not in {DATA_VERSION_DVT1, DATA_VERSION_DVT2}:
         raise ValueError(f"Unsupported data_version: {data_version}")
 
     if image_keys is None:
-        image_keys = [key for key, feature in meta.features.items() if feature["dtype"] == "image"]
+        image_keys = [
+            key
+            for key, feature in meta.features.items()
+            if feature["dtype"] in ({"image", "video"} if source_is_v3 else {"image"})
+        ]
 
     episodes = sorted(meta.episodes.keys()) if episodes is None else episodes
     output_dir = get_default_output_dir(root) if output_dir is None else Path(output_dir)
     prepare_workers = max(1, int(prepare_workers or 1))
+    fallback_stage_count = int(fallback_stage_count)
+    if fallback_stage_count < 2:
+        raise ValueError("fallback_stage_count must be at least 2")
 
     static_dir = output_dir / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
@@ -373,7 +421,6 @@ def run_precompute(
     if write_parquet and not annotate:
         logging.warning("--write-parquet requires --annotate 1. Enabling --annotate automatically.")
         annotate = True
-
     _emit_progress(
         progress_callback,
         status="running",
@@ -382,14 +429,35 @@ def run_precompute(
         total=len(episodes),
         message=f"Checking existing video/CSV cache for {len(episodes)} episodes",
     )
-    needs_prepare = overwrite_video or overwrite_csv or not _all_precomputed_files_exist(
-        static_dir=static_dir,
-        episodes=episodes,
-        image_keys=image_keys,
-        prepare_videos=prepare_videos,
-        prepare_csv=prepare_csv,
-        downsample=downsample,
+    needs_prepare = (
+        overwrite_video
+        or overwrite_csv
+        or not _all_precomputed_files_exist(
+            static_dir=static_dir,
+            episodes=episodes,
+            image_keys=image_keys,
+            prepare_videos=prepare_videos,
+            prepare_csv=prepare_csv,
+            downsample=downsample,
+        )
     )
+    prepared = bool(needs_prepare)
+    if source_is_v3 and needs_prepare and (prepare_videos or prepare_csv):
+        run_v3_viewer_precompute(
+            root=root,
+            repo_id=repo_id,
+            episodes=episodes,
+            output_dir=output_dir,
+            prepare_videos=prepare_videos,
+            prepare_csv=prepare_csv,
+            workers=prepare_workers,
+            downsample=downsample,
+            overwrite_videos=overwrite_video,
+            overwrite_csv=overwrite_csv,
+            data_version=data_version,
+            progress_callback=progress_callback,
+        )
+        needs_prepare = False
 
     _emit_progress(
         progress_callback,
@@ -401,10 +469,12 @@ def run_precompute(
     )
 
     if fix_episode_indices_enabled:
-        _emit_progress(progress_callback, status="running", step="fix_indices", message="Checking episode indices")
+        _emit_progress(
+            progress_callback, status="running", step="fix_indices", message="Checking episode indices"
+        )
         indices_fixed = fix_episode_indices(root, meta, episodes)
         if indices_fixed:
-            meta = LeRobotDatasetMetadata(repo_id, root=root)
+            meta = load_platform_metadata(root, repo_id)
             overwrite_csv = True
             needs_prepare = True
             logging.info("Parquet indices were fixed — forcing CSV overwrite")
@@ -446,6 +516,7 @@ def run_precompute(
                         overwrite_csv,
                         force_recompute_stage=bool(force_recompute_stage),
                         data_version=data_version,
+                        fallback_stage_count=fallback_stage_count,
                     )
                     return episode_id, boundaries, episode_issues
 
@@ -488,7 +559,10 @@ def run_precompute(
                         message=f"Preparing {len(episodes)} episodes with {prepare_workers} workers",
                     )
                     with ThreadPoolExecutor(max_workers=min(prepare_workers, len(episodes))) as executor:
-                        futures = {executor.submit(_prepare_episode, episode_id): episode_id for episode_id in episodes}
+                        futures = {
+                            executor.submit(_prepare_episode, episode_id): episode_id
+                            for episode_id in episodes
+                        }
                         for idx, future in enumerate(as_completed(futures), start=1):
                             episode_id, boundaries, episode_issues = future.result()
                             if boundaries is not None:
@@ -510,7 +584,9 @@ def run_precompute(
                     progress.close()
         else:
             logging.info("No precompute tasks selected. Skip prepare stage.")
-            _emit_progress(progress_callback, status="running", step="skip", message="No precompute tasks selected")
+            _emit_progress(
+                progress_callback, status="running", step="skip", message="No precompute tasks selected"
+            )
     else:
         if visualize_only:
             logging.info("Visualize-only mode: skip prepare stage.")
@@ -529,7 +605,9 @@ def run_precompute(
         _write_annotation_issues(static_dir, all_issues, scanned_episodes=episodes)
 
     if all_boundaries and write_parquet:
-        _emit_progress(progress_callback, status="running", step="write_parquet", message="Writing subtask_state")
+        _emit_progress(
+            progress_callback, status="running", step="write_parquet", message="Writing subtask_state"
+        )
         episode_stats = write_subtask_state_to_parquet(root, meta, all_boundaries)
         update_info_features(
             root,
@@ -547,7 +625,9 @@ def run_precompute(
         _write_subtask_annotations(static_dir, all_boundaries, overwrite_csv)
 
     if write_subtask:
-        _emit_progress(progress_callback, status="running", step="write_subtask", message="Writing subtask text")
+        _emit_progress(
+            progress_callback, status="running", step="write_subtask", message="Writing subtask text"
+        )
         written = write_subtask_text_to_parquet(root, meta, episodes)
         logging.info("Wrote subtask text for %d episodes", written)
         update_info_features(
@@ -561,19 +641,20 @@ def run_precompute(
             },
         )
 
-    try:
-        write_viewer_manifest(
-            root=root,
-            repo_id=repo_id,
-            meta=meta,
-            episodes=episodes,
-            image_keys=image_keys,
-            static_dir=static_dir,
-            data_version=data_version,
-            downsample=downsample,
-        )
-    except OSError as exc:
-        logging.warning("Could not write viewer manifest to %s: %s", static_dir, exc)
+    if not source_is_v3:
+        try:
+            write_viewer_manifest(
+                root=root,
+                repo_id=repo_id,
+                meta=meta,
+                episodes=episodes,
+                image_keys=image_keys,
+                static_dir=static_dir,
+                data_version=data_version,
+                downsample=downsample,
+            )
+        except OSError as exc:
+            logging.warning("Could not write viewer manifest to %s: %s", static_dir, exc)
 
     labeling_result = None
     if label_bbox:
@@ -730,7 +811,11 @@ def run_precompute(
 
     if merge_tags:
         tag_merge_result = merge_tags_to_metadata(root, static_dir / "tagging")
-        logging.info("Merged tags for %d episodes into %s", tag_merge_result["merged"], tag_merge_result["episodes_path"])
+        logging.info(
+            "Merged tags for %d episodes into %s",
+            tag_merge_result["merged"],
+            tag_merge_result["episodes_path"],
+        )
 
     embedding_result = None
     if embed_policy is not None:
@@ -747,12 +832,17 @@ def run_precompute(
             refit=embed_refit,
             progress_callback=progress_callback,
         )
-        logging.info("Wrote embeddings for %d episodes to %s", embedding_result.points, embedding_result.embedding_dir)
+        logging.info(
+            "Wrote embeddings for %d episodes to %s", embedding_result.points, embedding_result.embedding_dir
+        )
 
     compare_result = None
     if compare_with is not None:
         compare_root = Path(compare_with).expanduser()
-        compare_meta = LeRobotDatasetMetadata(f"local/{compare_root.name or 'dataset'}", root=compare_root)
+        compare_meta = load_platform_metadata(
+            compare_root,
+            f"local/{compare_root.name or 'dataset'}",
+        )
         compare_static = get_default_output_dir(compare_root) / "static"
         compare_static.mkdir(parents=True, exist_ok=True)
         compare_result = run_compare_build(
@@ -783,7 +873,7 @@ def run_precompute(
         static_dir=static_dir,
         episodes=episodes,
         image_keys=image_keys,
-        prepared=needs_prepare,
+        prepared=prepared,
         annotation_issues=all_issues,
         subtask_boundaries=all_boundaries,
         labeling_result=labeling_result,
@@ -796,6 +886,7 @@ def run_precompute(
     )
 
 
+@audit_cli_main
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -910,6 +1001,12 @@ def main():
         help="Force recompute subtask stage even if subtask_state exists in parquet (default: read from parquet).",
     )
     parser.add_argument(
+        "--fallback-stage-count",
+        type=int,
+        default=DEFAULT_FALLBACK_STAGE_COUNT,
+        help="Number of equal-duration stages for tasks without pick/place/give rules. Default: 5.",
+    )
+    parser.add_argument(
         "--write-subtask",
         type=int,
         default=0,
@@ -935,6 +1032,68 @@ def main():
         type=int,
         default=0,
         help="Create a sibling dataset with action/state vectors trimmed to --preprocess-target-dim.",
+    )
+    parser.add_argument(
+        "--preprocess-convert-v3",
+        type=int,
+        default=0,
+        help=(
+            "Convert a v2.1 dataset to the LeRobot 0.4.4 v3.0 layout. "
+            "Parquet image cameras use the selected official or RGB-lossless MP4 encoding. "
+            "An existing v3.0 dataset is reported unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--preprocess-v3-out",
+        type=Path,
+        default=None,
+        help="Output root for v2.1 conversion. Defaults to a new sibling directory.",
+    )
+    parser.add_argument(
+        "--preprocess-v3-data-file-size-mb",
+        type=int,
+        default=100,
+        help="Maximum target parquet file size for --preprocess-convert-v3.",
+    )
+    parser.add_argument(
+        "--preprocess-v3-video-file-size-mb",
+        type=int,
+        default=200,
+        help="Maximum target video file size for --preprocess-convert-v3.",
+    )
+    parser.add_argument(
+        "--preprocess-v3-workers",
+        type=int,
+        default=DEFAULT_V3_CONVERT_WORKERS,
+        help="Parallel episode workers for Parquet image-to-MP4 encoding. Default: 8.",
+    )
+    parser.add_argument(
+        "--preprocess-v3-image-video-mode",
+        choices=sorted(IMAGE_VIDEO_MODES),
+        default=IMAGE_VIDEO_MODE_LEROBOT_OFFICIAL,
+        help=(
+            "Encoding for Parquet image cameras: lerobot_official uses LeRobot 0.4.4 "
+            "AV1/yuv420p/CRF 30 defaults; rgb_lossless uses H.264 RGB/CRF 0. "
+            "Both preserve the source resolution. Default: lerobot_official."
+        ),
+    )
+    parser.add_argument(
+        "--preprocess-v3-overwrite",
+        type=int,
+        default=0,
+        help=(
+            "Overwrite an existing v3 output directory. Interactive CLI runs ask for "
+            "confirmation when this is 0."
+        ),
+    )
+    parser.add_argument(
+        "--preprocess-repair-v3-video-timestamps",
+        type=int,
+        default=0,
+        help=(
+            "Stream-copy remux v3 MP4 shards onto the dataset FPS grid and rewrite "
+            "episode video from/to timestamps. Encoded frames and norm stats are unchanged."
+        ),
     )
     parser.add_argument(
         "--preprocess-target-dim",
@@ -1147,13 +1306,13 @@ def main():
         "--label-vis",
         type=int,
         default=0,
-        help="Save bbox visualization PNGs under <output-dir>/static/labeling/vis.",
+        help="Save rendered bbox images under <output-dir>/static/labeling/vis.",
     )
     parser.add_argument(
         "--merge-labels",
         type=int,
         default=0,
-        help="Merge existing labels_reviewed.jsonl into meta/episodes.jsonl.",
+        help="Merge existing labels_reviewed.jsonl into v2.1 or v3 episode metadata.",
     )
     parser.add_argument(
         "--construct-data",
@@ -1261,7 +1420,7 @@ def main():
         "--merge-tags",
         type=int,
         default=0,
-        help="Merge current tagging results into meta/episodes.jsonl.",
+        help="Merge current tagging results into v2.1 or v3 episode metadata.",
     )
     parser.add_argument(
         "--embed-policy",
@@ -1397,6 +1556,38 @@ def main():
 
     preprocess_ran = False
     dry_run = bool(args.preprocess_dry_run)
+    if args.preprocess_convert_v3:
+        overwrite_v3 = bool(args.preprocess_v3_overwrite)
+        target_v3_root = args.preprocess_v3_out or default_v3_path(args.root)
+        if not is_v3_dataset(args.root) and target_v3_root.exists() and not dry_run and not overwrite_v3:
+            if not sys.stdin.isatty():
+                raise FileExistsError(
+                    f"Output dataset already exists: {target_v3_root}. "
+                    "Pass --preprocess-v3-overwrite 1 to confirm replacement."
+                )
+            answer = input(f"Output dataset already exists: {target_v3_root}. Overwrite? [y/N] ")
+            if answer.strip().lower() not in {"y", "yes"}:
+                raise RuntimeError("v3 conversion cancelled")
+            overwrite_v3 = True
+        result = run_convert_v3(
+            args.root,
+            out_root=args.preprocess_v3_out,
+            data_file_size_in_mb=args.preprocess_v3_data_file_size_mb,
+            video_file_size_in_mb=args.preprocess_v3_video_file_size_mb,
+            workers=args.preprocess_v3_workers,
+            image_video_mode=args.preprocess_v3_image_video_mode,
+            overwrite=overwrite_v3,
+            dry_run=dry_run,
+        )
+        logging.info("Preprocess convert_v3 result: %s", result)
+        preprocess_ran = True
+    if args.preprocess_repair_v3_video_timestamps:
+        result = repair_v3_video_timestamps(
+            args.root,
+            dry_run=dry_run,
+        )
+        logging.info("Preprocess repair_v3_video_timestamps result: %s", result)
+        preprocess_ran = True
     if args.preprocess_convert_action:
         result = run_convert_action(
             args.root,
@@ -1553,6 +1744,7 @@ def main():
         annotate=bool(args.annotate),
         write_parquet=bool(args.write_parquet),
         force_recompute_stage=bool(args.force_recompute_stage),
+        fallback_stage_count=args.fallback_stage_count,
         write_subtask=bool(args.write_subtask),
         overwrite_parquet=bool(args.overwrite_parquet),
         overwrite_subtask_text=bool(args.overwrite_subtask_text),

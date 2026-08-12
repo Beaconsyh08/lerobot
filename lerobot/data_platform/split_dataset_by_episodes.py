@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Legacy parquet-only splitter for fixed-size episode groups.
+"""Split a LeRobot dataset into fixed-size episode groups.
 
-This script:
+For v2.1, the legacy parquet-only behavior:
 - copies meta/tasks.jsonl and norm_stats.json as-is
 - slices meta/episodes.jsonl and meta/episodes_stats.jsonl
 - reindexes episodes per split starting at 0
 - rewrites parquet files to update episode_index and index columns
 - updates meta/info.json totals/splits/chunks_size
 
-It does not copy image or video assets. Prefer
-``lerobot.data_platform.precompute.preprocess.run_split`` for general dataset splitting.
+For v3.0, it delegates to the shared data-platform splitter and preserves data,
+episode metadata, tasks, per-episode stats, and lossless RGB video shards.
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ import jsonlines
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from lerobot.data_platform.precompute.dataset_io import is_v3_dataset, load_episode_records
+from lerobot.data_platform.precompute.preprocess import run_split
 
 
 def load_json(path: Path) -> dict:
@@ -142,6 +145,29 @@ def main() -> None:
 
     meta_dir = root / "meta"
     info = load_json(meta_dir / "info.json")
+    chunk_size = args.chunk_size
+    if chunk_size <= 0:
+        raise ValueError("--chunk-size must be > 0")
+
+    if is_v3_dataset(root):
+        episode_indices = [int(row["episode_index"]) for row in load_episode_records(root)]
+        base_name = args.name_prefix or root.name
+        total_splits = math.ceil(len(episode_indices) / chunk_size)
+        for split_idx in range(total_splits):
+            group = episode_indices[split_idx * chunk_size : (split_idx + 1) * chunk_size]
+            if not group:
+                continue
+            out_dir = args.out_root / f"{base_name}_part-{split_idx:03d}"
+            result = run_split(
+                root,
+                out_root=out_dir,
+                episode_range=(group[0], group[-1] + 1),
+            )
+            print(
+                f"[{split_idx + 1}/{total_splits}] Wrote "
+                f"{result.total_episodes} episodes, {result.total_frames} frames -> {out_dir}"
+            )
+        return
 
     episodes = load_jsonlines(meta_dir / "episodes.jsonl")
     episodes = sorted(episodes, key=lambda x: x["episode_index"])
@@ -151,10 +177,6 @@ def main() -> None:
     stats_by_index = {row["episode_index"]: row for row in episodes_stats}
 
     episode_indices = [row["episode_index"] for row in episodes]
-    chunk_size = args.chunk_size
-    if chunk_size <= 0:
-        raise ValueError("--chunk-size must be > 0")
-
     base_name = args.name_prefix or root.name
     total_splits = math.ceil(len(episode_indices) / chunk_size)
 
@@ -188,7 +210,9 @@ def main() -> None:
 
             new_episodes.append(update_episode_row(ep_row, new_ep_idx))
             if old_ep_idx in stats_by_index:
-                new_stats.append(update_episode_stats_row(stats_by_index[old_ep_idx], new_ep_idx, index_cursor, length))
+                new_stats.append(
+                    update_episode_stats_row(stats_by_index[old_ep_idx], new_ep_idx, index_cursor, length)
+                )
 
             src_path = root / info["data_path"].format(
                 episode_chunk=old_ep_idx // info["chunks_size"],
@@ -215,7 +239,7 @@ def main() -> None:
         write_json(out_meta / "info.json", new_info)
 
         print(
-            f"[{split_idx+1}/{total_splits}] Wrote {len(group)} episodes, "
+            f"[{split_idx + 1}/{total_splits}] Wrote {len(group)} episodes, "
             f"{total_frames} frames -> {out_dir}"
         )
 
