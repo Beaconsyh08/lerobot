@@ -884,8 +884,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
         """
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        using_internal_buffer = episode_data is None
+        episode_buffer = self.episode_buffer if using_internal_buffer else episode_data.copy()
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -947,11 +947,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if img_dir.is_dir():
             shutil.rmtree(self.root / "images")
 
-        if not episode_data:  # Reset the buffer
+        if using_internal_buffer:  # Reset the buffer
             self.episode_buffer = self.create_episode_buffer()
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
-        episode_dict = {key: episode_buffer[key] for key in self.hf_features}
+        episode_dict = {}
+        for key, feature in self.hf_features.items():
+            values = episode_buffer[key]
+            if isinstance(feature, datasets.Value):
+                array = np.asarray(values)
+                if array.ndim == 2 and array.shape[1] == 1:
+                    values = array[:, 0]
+            episode_dict[key] = values
         ep_dataset = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
         ep_dataset = embed_images(ep_dataset)
         self.hf_dataset = concatenate_datasets([self.hf_dataset, ep_dataset])

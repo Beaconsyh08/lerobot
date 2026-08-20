@@ -623,7 +623,7 @@
                     </div>
 
                 </div>
-                <div class="space-y-4 px-4 py-4" x-show="['standardize', 'transform', 'dataset_ops'].includes(activeTab)">
+                <div class="space-y-4 px-4 py-4" x-show="['data_modification', 'standardize', 'transform', 'dataset_ops'].includes(activeTab)">
                     <div class="rounded border border-slate-800 bg-slate-950 px-3 py-3 text-xs text-slate-400">
                         <div class="text-slate-300" x-text="preprocessPanelTitle()"></div>
                         <div class="mt-1 truncate" x-text="selectedDataset ? selectedDataset.repo_id : 'none'"></div>
@@ -638,6 +638,12 @@
                     </div>
 
                     <div class="grid gap-2 md:grid-cols-3" x-show="activeTab !== 'standardize'">
+                        <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                               x-show="activeTab === 'data_modification'"
+                               :class="preprocess.schema_op === 'value_edit' ? 'border-sky-700 bg-sky-950/30 text-sky-100' : 'text-slate-300'">
+                            <input type="radio" value="value_edit" x-model="preprocess.schema_op">
+                            <span>Set action/state values</span>
+                        </label>
                         <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
                                x-show="activeTab === 'transform' && consoleMode !== 'visualize'"
                                :class="preprocess.schema_op === 'convert_action' ? 'border-sky-700 bg-sky-950/30 text-sky-100' : 'text-slate-300'">
@@ -858,6 +864,105 @@
                         </label>
                     </div>
 
+                    <div class="space-y-4" x-show="preprocess.schema_op === 'value_edit'">
+                        <div class="rounded border border-sky-900/60 bg-sky-950/20 px-3 py-2 text-xs text-sky-200">
+                            Set several Action/State joint dimensions in one pass. Every edit is applied to every
+                            selected frame, and episode/global statistics are recalculated for the edited fields.
+                        </div>
+
+                        <div class="space-y-2">
+                            <div class="flex items-center justify-between gap-3">
+                                <span class="text-xs font-medium text-slate-300">value edits</span>
+                                <button type="button" class="dp-btn dp-btn-secondary" @click="addValueEdit()">
+                                    Add joint
+                                </button>
+                            </div>
+                            <div class="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-200"
+                                 x-show="editableFeatureOptions().length === 0">
+                                The selected dataset has no editable Action/State vector metadata.
+                            </div>
+                            <template x-for="(edit, editIndex) in preprocess.value_edits" :key="edit.id">
+                                <div class="grid gap-2 rounded border border-slate-800 bg-slate-950 p-3 md:grid-cols-[1fr_2fr_1fr_auto]">
+                                    <label class="block">
+                                        <span class="mb-1 block text-xs text-slate-400">field</span>
+                                        <select class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                                x-model="edit.field"
+                                                @change="edit.dimension = 0">
+                                            <template x-for="feature in editableFeatureOptions()" :key="feature.key">
+                                                <option :value="feature.key" x-text="feature.label"></option>
+                                            </template>
+                                        </select>
+                                    </label>
+                                    <label class="block">
+                                        <span class="mb-1 block text-xs text-slate-400">joint / dimension</span>
+                                        <select class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                                x-model.number="edit.dimension">
+                                            <template x-for="dimension in editableDimensionOptions(edit.field)" :key="dimension.index">
+                                                <option :value="dimension.index" x-text="dimension.label"></option>
+                                            </template>
+                                        </select>
+                                    </label>
+                                    <label class="block">
+                                        <span class="mb-1 block text-xs text-slate-400">set value</span>
+                                        <input type="number" step="any"
+                                               class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                               x-model.number="edit.value">
+                                    </label>
+                                    <button type="button" class="dp-btn dp-btn-danger self-end"
+                                            @click="removeValueEdit(editIndex)"
+                                            :disabled="preprocess.value_edits.length <= 1">
+                                        Remove
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+
+                        <div class="grid gap-3 md:grid-cols-2">
+                            <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                                   :class="preprocess.value_episode_scope === 'selected' ? 'border-sky-700 text-sky-100' : 'text-slate-300'">
+                                <input type="radio" value="selected" x-model="preprocess.value_episode_scope">
+                                <span>Selected episodes</span>
+                            </label>
+                            <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                                   :class="preprocess.value_episode_scope === 'all' ? 'border-sky-700 text-sky-100' : 'text-slate-300'">
+                                <input type="radio" value="all" x-model="preprocess.value_episode_scope">
+                                <span>All episodes</span>
+                            </label>
+                        </div>
+                        <label class="block" x-show="preprocess.value_episode_scope === 'selected'">
+                            <span class="mb-1 block text-xs text-slate-400">episode ids</span>
+                            <input class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                   x-model="preprocess.value_episode_ids"
+                                   placeholder="e.g. 1,3-10,12">
+                            <span class="mt-1 block text-[11px] text-slate-500">Comma/space separated ids or inclusive ranges.</span>
+                        </label>
+
+                        <div class="grid gap-3 md:grid-cols-2">
+                            <label class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950 px-3 py-2"
+                                   :class="preprocess.value_output_mode === 'new_dataset' ? 'border-emerald-700 text-emerald-100' : 'text-slate-300'">
+                                <input type="radio" value="new_dataset" x-model="preprocess.value_output_mode">
+                                <span>
+                                    <span>Generate new dataset</span>
+                                    <span class="block text-[11px] text-slate-500">Keeps the source unchanged. Recommended.</span>
+                                </span>
+                            </label>
+                            <label class="flex items-center gap-2 rounded border border-red-900/60 bg-slate-950 px-3 py-2"
+                                   :class="preprocess.value_output_mode === 'in_place' ? 'border-red-700 text-red-100' : 'text-red-200'">
+                                <input type="radio" value="in_place" x-model="preprocess.value_output_mode">
+                                <span>
+                                    <span>Modify source in-place</span>
+                                    <span class="block text-[11px] text-red-300/70">Cannot be undone by Data Platform.</span>
+                                </span>
+                            </label>
+                        </div>
+                        <label class="block" x-show="preprocess.value_output_mode === 'new_dataset'">
+                            <span class="mb-1 block text-xs text-slate-400">output root</span>
+                            <input class="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-sky-500"
+                                   x-model="preprocess.value_out_root"
+                                   placeholder="auto: &lt;src&gt;_value_edit_&lt;timestamp&gt;">
+                        </label>
+                    </div>
+
                     <div class="grid gap-3 md:grid-cols-2" x-show="preprocess.schema_op === 'rewrite_prompts'">
                         <div class="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-400 md:col-span-2">
                             <div class="text-slate-300">Rewrite prompt text in-place</div>
@@ -949,7 +1054,7 @@
                     <div class="dp-action-row">
                         <button class="dp-btn dp-btn-primary dp-full"
                                 @click="startSchemaFix()"
-                                :class="preprocess.schema_op === 'delete_episodes' ? 'dp-btn-danger' : ''"
+                                :class="preprocess.schema_op === 'delete_episodes' || (preprocess.schema_op === 'value_edit' && preprocess.value_output_mode === 'in_place') ? 'dp-btn-danger' : ''"
                                 :disabled="!canStartSchemaFix() || busy"
                                 x-text="schemaActionLabel()">
                         </button>
@@ -1867,6 +1972,7 @@
                 embeddingCapabilities: null,
                 compareCandidates: [],
                 registration: {root: ''},
+                valueEditNextId: 2,
                 preprocess: {
                     schema_op: 'convert_action',
                     target_dim: 16,
@@ -1891,6 +1997,11 @@
                     delete_flag_reason: '',
                     delete_episode_ids: '',
                     apply_prompt_assignment_episode_ids: '',
+                    value_edits: [{id: 1, field: 'action', dimension: 0, value: 0}],
+                    value_episode_scope: 'selected',
+                    value_episode_ids: '',
+                    value_output_mode: 'new_dataset',
+                    value_out_root: '',
                     schema_out_root: '',
                     schema_dry_run: false,
                     split_merge_op: 'split',
@@ -2008,7 +2119,7 @@
                         this.safeStartupLoad(() => this.loadJobs()),
                         this.safeStartupLoad(() => this.loadOperationLogs())
                     ];
-                    if (['quality_flags', 'standardize', 'transform', 'dataset_ops', 'split_merge'].some(tab => this.tabEnabled(tab))) {
+                    if (['quality_flags', 'data_modification', 'standardize', 'transform', 'dataset_ops', 'split_merge'].some(tab => this.tabEnabled(tab))) {
                         startupLoads.push(this.safeStartupLoad(() => this.loadPreprocessCapabilities()));
                     }
                     if (this.tabEnabled('labeling')) {
@@ -2069,6 +2180,7 @@
                     return group.tabs;
                 },
                 tabDefaultSchemaOp(tab) {
+                    if (tab === 'data_modification') return 'value_edit';
                     if (tab === 'standardize') return 'standardize';
                     if (tab === 'transform') return 'convert_action';
                     if (tab === 'dataset_ops') return this.consoleMode === 'visualize' ? 'delete_episodes' : 'rewrite_prompts';
@@ -2076,6 +2188,7 @@
                 },
                 syncSchemaOpForTab(tab) {
                     const allowed = {
+                        data_modification: ['value_edit'],
                         standardize: ['standardize'],
                         transform: ['convert_action', 'convert_v3', 'drop_field', 'smooth_action'],
                         dataset_ops: this.consoleMode === 'visualize'
@@ -2373,6 +2486,7 @@
                         this.replaceDataset(data.dataset);
                         if (this.selectedDatasetKey === datasetKey && (token === null || token === this.selectionToken)) {
                             this.selectedDataset = data.dataset;
+                            this.syncValueEditFeatures();
                             this.applyDatasetDataVersion(data.dataset);
                         }
                         return data.dataset;
@@ -2408,6 +2522,7 @@
                     if (datasetChanged) this.resetDeleteFlagReasonState();
                     this.selectedDataset = dataset;
                     this.selectedDatasetKey = dataset.key;
+                    this.syncValueEditFeatures();
                     if (this.selectedDatasetIsV3() && this.preprocess.schema_op === 'convert_v3') {
                         this.preprocess.schema_op = 'convert_action';
                     }
@@ -2646,12 +2761,80 @@
                         this.deleteFlagReasonLoading = false;
                     }
                 },
+                editableFeatureOptions() {
+                    return (this.selectedDataset && this.selectedDataset.editable_features) || [];
+                },
+                syncValueEditFeatures() {
+                    const features = this.editableFeatureOptions();
+                    if (!features.length) return;
+                    for (const edit of this.preprocess.value_edits) {
+                        let feature = features.find(item => item.key === edit.field);
+                        if (!feature) {
+                            feature = features[0];
+                            edit.field = feature.key;
+                            edit.dimension = 0;
+                        }
+                        if (Number(edit.dimension) >= Number(feature.dimension || 0)) {
+                            edit.dimension = 0;
+                        }
+                    }
+                },
+                editableDimensionOptions(fieldName) {
+                    const feature = this.editableFeatureOptions().find(item => item.key === fieldName);
+                    if (!feature) return [];
+                    const names = Array.isArray(feature.names) ? feature.names : [];
+                    return Array.from({length: Number(feature.dimension || 0)}, (_, index) => ({
+                        index,
+                        label: names[index] ? `${index} · ${names[index]}` : String(index)
+                    }));
+                },
+                addValueEdit() {
+                    const firstFeature = this.editableFeatureOptions()[0];
+                    this.preprocess.value_edits.push({
+                        id: this.valueEditNextId++,
+                        field: firstFeature ? firstFeature.key : 'action',
+                        dimension: 0,
+                        value: 0
+                    });
+                },
+                removeValueEdit(index) {
+                    if (this.preprocess.value_edits.length <= 1) return;
+                    this.preprocess.value_edits.splice(index, 1);
+                },
+                normalizedValueEdits() {
+                    return this.preprocess.value_edits.map(edit => ({
+                        field: edit.field,
+                        dimension: Number(edit.dimension),
+                        value: Number(edit.value)
+                    }));
+                },
                 canStartSchemaFix() {
                     if (!this.selectedDataset || this.busy) return false;
                     if (this.preprocess.schema_op === 'delete_episodes') {
                         return Boolean(this.preprocess.delete_episode_ids.trim());
                     }
                     if (this.preprocessCapabilities && !this.preprocessCapabilities.available) return false;
+                    if (this.preprocess.schema_op === 'value_edit') {
+                        const features = new Map(this.editableFeatureOptions().map(item => [item.key, item]));
+                        const edits = this.normalizedValueEdits();
+                        const keys = new Set();
+                        if (!edits.length) return false;
+                        for (const edit of edits) {
+                            const feature = features.get(edit.field);
+                            const key = `${edit.field}:${edit.dimension}`;
+                            if (
+                                !feature
+                                || !Number.isInteger(edit.dimension)
+                                || edit.dimension < 0
+                                || edit.dimension >= Number(feature.dimension || 0)
+                                || !Number.isFinite(edit.value)
+                                || keys.has(key)
+                            ) return false;
+                            keys.add(key);
+                        }
+                        return this.preprocess.value_episode_scope === 'all'
+                            || Boolean(this.preprocess.value_episode_ids.trim());
+                    }
                     if (this.preprocess.schema_op === 'standardize') return true;
                     if (this.preprocess.schema_op === 'fix_prompt_prepositions') return true;
                     if (this.preprocess.schema_op === 'apply_prompt_assignments') return true;
@@ -2676,18 +2859,21 @@
                     return Number(this.preprocess.target_dim || 0) > 0;
                 },
                 preprocessPanelTitle() {
+                    if (this.activeTab === 'data_modification') return 'Data modification';
                     if (this.activeTab === 'standardize') return 'Standardize dataset';
                     if (this.activeTab === 'transform') return 'Feature transforms';
                     if (this.activeTab === 'dataset_ops') return 'Dataset operations';
                     return 'Preprocess';
                 },
                 preprocessPanelDescription() {
+                    if (this.activeTab === 'data_modification') return 'Set one or more Action/State joint values for selected or all episodes.';
                     if (this.activeTab === 'standardize') return 'Build a training-ready sibling dataset with normalized 16D action/state and stage/subtask fields.';
                     if (this.activeTab === 'transform') return 'Generate sibling datasets with smaller schema/feature transformations.';
                     if (this.activeTab === 'dataset_ops') return 'Run dataset-level repairs or in-place maintenance actions.';
                     return '';
                 },
                 schemaActionLabel() {
+                    if (this.preprocess.schema_op === 'value_edit') return this.preprocess.schema_dry_run ? 'Preview value edits' : 'Apply value edits';
                     if (this.preprocess.schema_op === 'delete_episodes') return 'Delete episodes';
                     if (this.preprocess.schema_op === 'standardize') return this.preprocess.schema_dry_run ? 'Preview standardize' : 'Standardize dataset';
                     if (this.preprocess.schema_op === 'convert_action') return this.preprocess.schema_dry_run ? 'Preview conversion' : 'Convert action/state dim';
@@ -2763,6 +2949,32 @@
                         ? (this.selectedDataset && this.selectedDataset.key)
                         : await this.ensureSelectedDatasetLoaded();
                     if (!datasetKey) return;
+                    if (this.preprocess.schema_op === 'value_edit') {
+                        const edits = this.normalizedValueEdits();
+                        const scopeText = this.preprocess.value_episode_scope === 'all'
+                            ? 'all episodes'
+                            : `episodes ${this.preprocess.value_episode_ids.trim()}`;
+                        if (
+                            !this.preprocess.schema_dry_run
+                            && this.preprocess.value_output_mode === 'in_place'
+                            && !confirm(
+                                `Apply ${edits.length} value edit(s) to ${scopeText} in ${datasetKey}?\n\n`
+                                + 'This modifies the source dataset in-place and cannot be undone by Data Platform.'
+                            )
+                        ) return;
+                        await this.startPreprocessJob('/api/preprocess/value_edit/start', {
+                            dataset_key: datasetKey,
+                            options: {
+                                edits,
+                                episode_scope: this.preprocess.value_episode_scope,
+                                episodes: this.preprocess.value_episode_ids,
+                                output_mode: this.preprocess.value_output_mode,
+                                out_root: this.preprocess.value_out_root,
+                                dry_run: this.preprocess.schema_dry_run
+                            }
+                        }, datasetKey);
+                        return;
+                    }
                     if (this.preprocess.schema_op === 'convert_v3') {
                         await this.startPreprocessJob('/api/preprocess/convert_v3/start', {
                             dataset_key: datasetKey,

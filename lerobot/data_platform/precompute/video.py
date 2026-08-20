@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -10,6 +12,19 @@ import numpy as np
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.data_platform.precompute.image_io import iter_image_bytes
+
+
+def temporary_output_path(target: Path) -> Path:
+    """Return a unique sibling path that preserves the target suffix."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.stem}.",
+        suffix=target.suffix,
+        dir=target.parent,
+    )
+    os.close(descriptor)
+    return Path(name)
 
 
 def encode_with_ffmpeg(
@@ -24,8 +39,11 @@ def encode_with_ffmpeg(
         logging.error("ffmpeg not found in PATH.")
         return False
 
+    temporary = temporary_output_path(out_path)
     cmd = [
         ffmpeg_path,
+        "-loglevel",
+        "error",
         "-y",
         "-f",
         "rawvideo",
@@ -48,24 +66,37 @@ def encode_with_ffmpeg(
         "yuv420p",
         "-movflags",
         "+faststart",
-        str(out_path),
+        str(temporary),
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert proc.stdin is not None
-    for frame in frame_iter:
-        proc.stdin.write(frame.tobytes())
-    proc.stdin.close()
-    proc.stdin = None
-    _, err = proc.communicate()
-    if proc.returncode != 0:
-        logging.warning("ffmpeg failed to encode video: %s", err.decode(errors="ignore"))
-        return False
-    return True
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdin is not None
+        for frame in frame_iter:
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.stdin = None
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            logging.warning("ffmpeg failed to encode video: %s", err.decode(errors="ignore"))
+            return False
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            logging.warning("ffmpeg produced an empty video: %s", temporary)
+            return False
+        temporary.replace(out_path)
+        return True
+    except Exception:
+        if proc is not None and hasattr(proc, "poll") and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def encode_episode_video(
@@ -84,8 +115,12 @@ def encode_episode_video(
     rel_path = Path("videos") / image_key / f"episode_{episode_id:06d}_h264.mp4"
     out_path = static_dir / rel_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists() and not overwrite:
-        return out_path
+    if not overwrite:
+        try:
+            if out_path.is_file() and out_path.stat().st_size > 0:
+                return out_path
+        except OSError:
+            pass
 
     frame_iter = iter_image_bytes(parquet_path, dataset_root, image_key, max_frames=max_frames)
     first_bytes = next(frame_iter, None)

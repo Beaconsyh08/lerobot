@@ -47,6 +47,7 @@ from lerobot.data_platform.precompute.preprocess import (
     run_split,
     run_standardize_dataset,
     run_subtract,
+    run_value_edits,
 )
 from lerobot.data_platform.precompute.preprocess import (
     get_capabilities as get_preprocess_capabilities,
@@ -148,6 +149,23 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
     def _out_root(options: dict) -> Path | None:
         value = str(options.get("out_root") or "").strip()
         return Path(value).expanduser() if value else None
+
+    def _invalidate_value_edit_cache(static_dir: Path, episode_ids: list[int] | None) -> int:
+        csv_dir = Path(static_dir) / "csv"
+        if not csv_dir.is_dir():
+            return 0
+        paths = (
+            list(csv_dir.glob("episode_*_ds*.csv"))
+            if episode_ids is None
+            else [
+                path
+                for episode_id in set(episode_ids)
+                for path in csv_dir.glob(f"episode_{episode_id:06d}_ds*.csv")
+            ]
+        )
+        for path in paths:
+            path.unlink(missing_ok=True)
+        return len(paths)
 
     def _merge_out_root(options: dict) -> Path | None:
         out_name = str(options.get("out_name") or "").strip()
@@ -607,6 +625,107 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 ctx.fail_job(job, "Preprocess drop_field failed", exc)
 
         threading.Thread(target=_run_job, name=f"preprocess-drop-{job['id']}", daemon=True).start()
+        return jsonify({"job": ctx.serialize_job(job)})
+
+    @app.route("/api/preprocess/value_edit/start", methods=["POST"])
+    def api_preprocess_value_edit_start():
+        body = request.get_json(silent=True) or {}
+        options = body.get("options") or body
+        try:
+            dataset_key = ctx.dataset_key_from_body(body)
+            dataset_obj, ds_static = ctx.ensure_dataset_loaded(dataset_key)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except KeyError:
+            return jsonify({"error": "dataset is not registered"}), 404
+
+        edits = options.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return jsonify({"error": "edits must contain at least one value edit"}), 400
+        scope = str(options.get("episode_scope") or "selected").strip().lower()
+        if scope not in {"all", "selected"}:
+            return jsonify({"error": "episode_scope must be all or selected"}), 400
+        try:
+            episode_ids = None if scope == "all" else ctx.parse_int_list(options.get("episodes"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if scope == "selected" and not episode_ids:
+            return jsonify({"error": "episodes are required when episode_scope is selected"}), 400
+
+        output_mode = str(options.get("output_mode") or "new_dataset").strip().lower()
+        if output_mode not in {"new_dataset", "in_place"}:
+            return jsonify({"error": "output_mode must be new_dataset or in_place"}), 400
+        in_place = output_mode == "in_place"
+        out_root = None if in_place else _out_root(options)
+        dry_run = ctx.bool_option(options, "dry_run", False)
+        total = (
+            int(getattr(dataset_obj, "total_episodes", 1) or 1)
+            if episode_ids is None
+            else len(set(episode_ids))
+        )
+        job = _new_job(
+            "preprocess_value_edit",
+            ctx.repo_id_from_key(dataset_key),
+            total,
+            str(dataset_obj.root if in_place else out_root or ""),
+        )
+
+        def _run_job() -> None:
+            try:
+                ctx.update_job(
+                    job,
+                    {
+                        "status": "running",
+                        "message": (
+                            f"Starting {len(edits)} value edit(s) in "
+                            f"{'source dataset' if in_place else 'a new dataset'}"
+                        ),
+                    },
+                )
+                result = run_value_edits(
+                    dataset_obj.root,
+                    edits=edits,
+                    episode_ids=episode_ids,
+                    in_place=in_place,
+                    out_root=out_root,
+                    dry_run=dry_run,
+                    progress_callback=lambda payload: ctx.update_job(job, payload),
+                )
+                if result.dry_run:
+                    ctx.finish_job(
+                        job,
+                        "Value edit dry run complete",
+                        current=total,
+                        total=total,
+                        output_root=str(result.out_root),
+                    )
+                elif not in_place:
+                    _register_output_dataset(result, job)
+                else:
+                    removed_cache_files = _invalidate_value_edit_cache(ds_static, episode_ids)
+                    if ctx.clear_dataset_caches is not None:
+                        ctx.clear_dataset_caches(dataset_key)
+                    refreshed = ctx.meta_only_dataset_cls(
+                        ctx.repo_id_from_key(dataset_key),
+                        root=dataset_obj.root,
+                    )
+                    ctx.register_dataset(refreshed, Path(ds_static).parent)
+                    result.summary["invalidated_csv_files"] = removed_cache_files
+                    ctx.finish_job(
+                        job,
+                        "Value edit complete in source dataset",
+                        current=total,
+                        total=total,
+                        output_root=str(dataset_obj.root),
+                        viewer_url=f"/{ctx.repo_id_from_key(dataset_key)}/episode_0",
+                    )
+                    with ctx.jobs_lock:
+                        ctx.append_job_log(job, f"Summary: {result.summary}")
+            except Exception as exc:
+                logging.exception("Preprocess value edit failed")
+                ctx.fail_job(job, "Preprocess value edit failed", exc)
+
+        threading.Thread(target=_run_job, name=f"preprocess-value-edit-{job['id']}", daemon=True).start()
         return jsonify({"job": ctx.serialize_job(job)})
 
     @app.route("/api/preprocess/smooth_action/start", methods=["POST"])

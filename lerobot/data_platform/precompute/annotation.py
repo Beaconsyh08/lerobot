@@ -16,6 +16,7 @@ from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT2,
     normalize_gripper_columns,
 )
+from lerobot.data_platform.precompute.video import temporary_output_path
 
 DVT1_GRIPPER_STAGE_MARGIN_SECONDS = 0.6
 DVT2_GRIPPER_STAGE_MARGIN_SECONDS = 0.2
@@ -1001,8 +1002,12 @@ def write_episode_csv(
     fallback_stage_count: int = DEFAULT_FALLBACK_STAGE_COUNT,
 ) -> tuple[bool, dict | None, list[dict]]:
     """Write a precomputed CSV for one episode."""
-    if out_path.exists() and not overwrite:
-        return True, None, []
+    if not overwrite:
+        try:
+            if out_path.is_file() and out_path.stat().st_size > 0:
+                return True, None, []
+        except OSError:
+            pass
 
     parquet_path = dataset_root / meta.get_data_file_path(episode_id)
     if not parquet_path.is_file():
@@ -1118,10 +1123,14 @@ def write_episode_csv(
         for row_idx, state in enumerate(states):
             rows[row_idx].append(state / float(max_stage))
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", newline="") as file_obj:
-        writer = csv.writer(file_obj)
-        writer.writerow(header)
-        writer.writerows(rows)
+    temporary = temporary_output_path(out_path)
+    try:
+        with temporary.open("w", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(header)
+            writer.writerows(rows)
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
     return True, boundaries, episode_issues

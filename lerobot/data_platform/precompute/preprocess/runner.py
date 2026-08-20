@@ -22,6 +22,7 @@ from lerobot.data_platform.precompute.preprocess.flag_fixes import run_flag_fix
 from lerobot.data_platform.precompute.preprocess.quality_flags import run_quality_flag_detection
 from lerobot.data_platform.precompute.preprocess.smooth_action import run_smooth_action
 from lerobot.data_platform.precompute.preprocess.standardize import run_standardize_dataset
+from lerobot.data_platform.precompute.preprocess.value_edit import run_value_edits
 
 
 def get_capabilities() -> dict:
@@ -53,6 +54,11 @@ def get_capabilities() -> dict:
                 "name": "standardize",
                 "available": _AVAILABLE,
                 "description": "Normalize DVT data to 16D action/state with stage/subtask writeback.",
+            },
+            {
+                "name": "value_edit",
+                "available": _AVAILABLE,
+                "description": "Set one or more action/state joint dimensions for selected episodes.",
             },
             {
                 "name": "quality_flags",
@@ -105,6 +111,8 @@ def run_preprocess_op(
         return run_standardize_dataset(
             src_root, out_root=out_root, progress_callback=progress_callback, **kwargs
         )
+    if op == "value_edit":
+        return run_value_edits(src_root, out_root=out_root, progress_callback=progress_callback, **kwargs)
     if op == "quality_flags":
         return run_quality_flag_detection(src_root, progress_callback=progress_callback, **kwargs)
     if op == "clear_flags":

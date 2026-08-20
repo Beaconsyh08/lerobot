@@ -192,6 +192,19 @@ def test_add_frame(tmp_path, empty_lerobot_dataset_factory):
     assert dataset[0]["state"].ndim == 0
 
 
+def test_save_explicit_episode_data(tmp_path, empty_lerobot_dataset_factory):
+    features = {"state": {"dtype": "float32", "shape": (1,), "names": None}}
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)
+    dataset.add_frame({"state": torch.tensor([1.0]), "task": "Dummy task"})
+    episode_data = deepcopy(dataset.episode_buffer)
+
+    dataset.save_episode(episode_data=episode_data)
+
+    assert len(dataset) == 1
+    assert dataset[0]["state"].item() == pytest.approx(1.0)
+    assert dataset.episode_buffer["size"] == 1
+
+
 def test_add_frame_state_1d(tmp_path, empty_lerobot_dataset_factory):
     features = {"state": {"dtype": "float32", "shape": (2,), "names": None}}
     dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features)

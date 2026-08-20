@@ -24,6 +24,7 @@ from lerobot.data_platform.precompute.preprocess.dataset_version import (
     validate_v3_dataset,
 )
 from lerobot.data_platform.precompute.timeseries import normalize_gripper_columns
+from lerobot.data_platform.precompute.video import temporary_output_path
 
 ProgressCallback = Callable[[dict], None] | None
 
@@ -39,6 +40,13 @@ class V3ViewerResult:
 def _emit(progress_callback: ProgressCallback, **payload) -> None:
     if progress_callback is not None:
         progress_callback(payload)
+
+
+def _has_nonempty_cache(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _load_episode_metadata(root: Path) -> pd.DataFrame:
@@ -164,18 +172,22 @@ def _write_episode_csv(
         matrices.append(matrix)
         header.extend(_feature_names(key, feature, dim))
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
-        writer.writerows(np.hstack(matrices).tolist())
+    temporary = temporary_output_path(out_path)
+    try:
+        with temporary.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(np.hstack(matrices).tolist())
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _clip_video(source: Path, target: Path, start: float, end: float) -> None:
     duration = end - start
     if duration <= 0:
         raise ValueError(f"Invalid v3.0 video interval {start}..{end}: {source}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = temporary_output_path(target)
     command = [
         "ffmpeg",
         "-loglevel",
@@ -196,17 +208,17 @@ def _clip_video(source: Path, target: Path, start: float, end: float) -> None:
         "yuv420p",
         "-movflags",
         "+faststart",
-        str(target),
+        str(temporary),
     ]
     try:
         subprocess.run(command, check=True)
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg did not create a valid viewer video: {temporary}")
+        temporary.replace(target)
     except FileNotFoundError as exc:
         raise RuntimeError("ffmpeg is required to prepare v3.0 viewer videos") from exc
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
-    if not target.is_file() or target.stat().st_size == 0:
-        raise RuntimeError(f"ffmpeg did not create a valid viewer video: {target}")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _decode_image(value: Any, root: Path) -> np.ndarray:
@@ -242,9 +254,9 @@ def _encode_image_feature(
     values = table.column(image_key).to_pylist()
     if not values:
         raise ValueError(f"No frames found for {image_key}, episode {int(episode['episode_index'])}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = temporary_output_path(target)
     try:
-        with av.open(str(target), mode="w") as container:
+        with av.open(str(temporary), mode="w") as container:
             stream = container.add_stream("libx264", rate=int(info["fps"]))
             first = _decode_image(values[0], root)
             stream.width = int(first.shape[1])
@@ -256,9 +268,11 @@ def _encode_image_feature(
                     container.mux(packet)
             for packet in stream.encode():
                 container.mux(packet)
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError(f"PyAV did not create a valid viewer video: {temporary}")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _task_list(value: Any) -> list[str]:
@@ -357,12 +371,12 @@ def run_v3_viewer_precompute(
         episode_index = int(episode["episode_index"])
         if prepare_csv:
             csv_path = csv_dir / f"episode_{episode_index:06d}_ds{downsample or 1}.csv"
-            if overwrite_csv or not csv_path.is_file():
+            if overwrite_csv or not _has_nonempty_cache(csv_path):
                 _write_episode_csv(root, info, episode, csv_path, downsample, data_version)
         if prepare_videos:
             for video_key in video_keys:
                 target = videos_dir / video_key / f"episode_{episode_index:06d}_h264.mp4"
-                if overwrite_videos or not target.is_file():
+                if overwrite_videos or not _has_nonempty_cache(target):
                     source = root / _format_video_path(info, episode, video_key)
                     _clip_video(
                         source,
@@ -372,7 +386,7 @@ def run_v3_viewer_precompute(
                     )
             for image_key in image_keys:
                 target = videos_dir / image_key / f"episode_{episode_index:06d}_h264.mp4"
-                if overwrite_videos or not target.is_file():
+                if overwrite_videos or not _has_nonempty_cache(target):
                     _encode_image_feature(root, info, episode, image_key, target)
         with completed_lock:
             completed += 1

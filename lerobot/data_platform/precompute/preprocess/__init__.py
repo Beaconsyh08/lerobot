@@ -53,6 +53,7 @@ from lerobot.data_platform.precompute.preprocess.standardize import (
     default_standardize_path,
     run_standardize_dataset,
 )
+from lerobot.data_platform.precompute.preprocess.value_edit import run_set_value, run_value_edits
 
 __all__ = [
     "PreprocessResult",
@@ -93,6 +94,8 @@ __all__ = [
     "run_stage_return_alignment",
     "run_stage_return_height_alignment",
     "run_standardize_dataset",
+    "run_set_value",
+    "run_value_edits",
     "run_split",
     "run_subtract",
     "detect_dataset_version",

@@ -487,6 +487,7 @@ _CONSOLE_GROUP_DEFS = [
             {"key": "cache", "label": "Cache"},
             {"key": "stage_subtask", "label": "Stage & Subtask"},
             {"key": "quality_flags", "label": "Abnormal Flags"},
+            {"key": "data_modification", "label": "Data Modification"},
             {"key": "standardize", "label": "Standardize"},
             {"key": "transform", "label": "Transform"},
             {"key": "dataset_ops", "label": "Dataset Ops"},
@@ -523,6 +524,7 @@ _CONSOLE_MODE_ALLOWED_TABS = {
         "cache",
         "stage_subtask",
         "quality_flags",
+        "data_modification",
         "standardize",
         "transform",
         "dataset_ops",
@@ -985,6 +987,33 @@ def run_server(
             "csv": {"cached": 0, "total": 0, "status": status},
         }
 
+    def _editable_vector_features(features: dict) -> list[dict]:
+        result = []
+        for key in ("action", "state"):
+            feature = (features or {}).get(key)
+            if not isinstance(feature, dict):
+                continue
+            shape = feature.get("shape") or []
+            if not shape:
+                continue
+            try:
+                dimension = int(shape[-1])
+            except (TypeError, ValueError):
+                continue
+            if dimension <= 0:
+                continue
+            raw_names = feature.get("names")
+            names = [str(name) for name in raw_names] if isinstance(raw_names, list) else []
+            result.append(
+                {
+                    "key": key,
+                    "label": "Action" if key == "action" else "State",
+                    "dimension": dimension,
+                    "names": names if len(names) == dimension else [],
+                }
+            )
+        return result
+
     def _read_light_dataset_info(root_path: Path, output_dir: Path | None = None) -> dict | None:
         info_path = root_path / "meta" / "info.json"
         try:
@@ -1001,6 +1030,7 @@ def run_server(
             return {
                 "total_episodes": int(manifest.get("total_episodes") or len(manifest_episode_ids(manifest))),
                 "image_keys": image_keys,
+                "editable_features": [],
                 "data_version": _normalize_data_version(manifest.get("data_version")),
                 "dataset_format_version": str(manifest.get("codebase_version") or ""),
             }
@@ -1017,6 +1047,7 @@ def run_server(
         return {
             "total_episodes": total_episodes,
             "image_keys": image_keys,
+            "editable_features": _editable_vector_features(features),
             "data_version": infer_data_version_from_features(features),
             "dataset_format_version": dataset_format_version,
         }
@@ -1532,6 +1563,7 @@ def run_server(
             "episodes": episode_ids,
             "episode_count": len(episode_ids),
             "image_keys": _dataset_image_keys(dataset_obj),
+            "editable_features": _editable_vector_features(dataset_obj.features),
             "data_version": infer_data_version_from_features(dataset_obj.features),
             "dataset_format_version": str(dataset_obj.meta.info.get("codebase_version") or ""),
             "cache": _cached_light_cache_status(Path(dataset_obj.root), ds_static.parent),
@@ -1569,6 +1601,7 @@ def run_server(
             "episodes": episode_ids if episode_ids else list(range(episode_count)),
             "episode_count": episode_count or None,
             "image_keys": image_keys,
+            "editable_features": list(info.get("editable_features") or []),
             "data_version": info.get("data_version", DATA_VERSION_DVT1),
             "dataset_format_version": info.get("dataset_format_version", ""),
             "cache": _cached_light_cache_status(root_path, output_dir),
@@ -1617,6 +1650,7 @@ def run_server(
             "episodes": episode_ids if episode_ids else list(range(total_episodes)),
             "episode_count": total_episodes,
             "image_keys": image_keys,
+            "editable_features": list(info.get("editable_features") or []),
             "data_version": info.get("data_version", DATA_VERSION_DVT1),
             "dataset_format_version": info.get("dataset_format_version", ""),
             "cache": _cached_light_cache_status(root_path, output_dir),
@@ -2272,7 +2306,14 @@ def run_server(
             blocked_prefixes.append("/api/compare")
         if not any(
             _tab_enabled(tab)
-            for tab in ("standardize", "transform", "dataset_ops", "split_merge", "quality_flags")
+            for tab in (
+                "standardize",
+                "transform",
+                "dataset_ops",
+                "split_merge",
+                "quality_flags",
+                "data_modification",
+            )
         ):
             blocked_prefixes.append("/api/preprocess")
         if any(path == prefix or path.startswith(f"{prefix}/") for prefix in blocked_prefixes):
@@ -3670,7 +3711,14 @@ def run_server(
     )
     if any(
         _tab_enabled(tab)
-        for tab in ("standardize", "transform", "dataset_ops", "split_merge", "quality_flags")
+        for tab in (
+            "standardize",
+            "transform",
+            "dataset_ops",
+            "split_merge",
+            "quality_flags",
+            "data_modification",
+        )
     ):
         register_preprocess_routes(app, route_context)
     if _tab_enabled("construction"):
@@ -6109,8 +6157,11 @@ def run_server(
                     logging.exception("Failed to delete v3 episode %s", episode_id)
                     yield _sse("error", {"message": str(exc)})
                     return
-                _clear_episode_dependent_caches((dataset_namespace, dataset_name))
-                remaining_ids = sorted(dataset.meta.episodes)
+                remaining_ids = _refresh_dataset_after_episode_delete(
+                    (dataset_namespace, dataset_name),
+                    dataset,
+                    ds_static,
+                )
                 if episodes is not None:
                     episodes.clear()
                     episodes.extend(remaining_ids)
@@ -6409,12 +6460,15 @@ def run_server(
 
             # --- 7. Clear caches & update server state ---
             yield _sse("progress", {"step": 7, "total": total_steps, "message": "Clearing caches..."})
-            _clear_episode_dependent_caches((dataset_namespace, dataset_name))
+            refreshed_episode_ids = _refresh_dataset_after_episode_delete(
+                (dataset_namespace, dataset_name),
+                dataset,
+                ds_static,
+            )
             # Update the closure-captured episodes list so sidebar reflects new indices
             if episodes is not None:
-                new_ep_list = list(range(new_total_eps))
                 episodes.clear()
-                episodes.extend(new_ep_list)
+                episodes.extend(refreshed_episode_ids)
 
             # --- 8. Finalize ---
             yield _sse("progress", {"step": 8, "total": total_steps, "message": "Done!"})

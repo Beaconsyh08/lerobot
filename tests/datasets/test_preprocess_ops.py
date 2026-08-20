@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
+from lerobot.data_platform.precompute import v3_viewer as v3_viewer_module
 from lerobot.data_platform.precompute.compare.stats import action_stats, metadata_stats
 from lerobot.data_platform.precompute.construction import run_construction
 from lerobot.data_platform.precompute.construction.review import (
@@ -69,6 +70,28 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
+
+
+def test_v3_viewer_clip_failure_preserves_existing_cache(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "viewer.mp4"
+    source.write_bytes(b"source")
+    target.write_bytes(b"old-cache")
+    commands = []
+
+    def _run(command, **_kwargs):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"partial-cache")
+        raise RuntimeError("ffmpeg failed")
+
+    monkeypatch.setattr(v3_viewer_module.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="ffmpeg failed"):
+        v3_viewer_module._clip_video(source, target, 0.0, 1.0)
+
+    assert Path(commands[0][-1]) != target
+    assert target.read_bytes() == b"old-cache"
+    assert not list(tmp_path.glob(".viewer.*.mp4"))
 
 
 def _make_dataset(root: Path, task: str = "pick duck", task_index: int = 0) -> None:
@@ -904,6 +927,23 @@ def test_prepare_v3_viewer_cache_in_current_environment(tmp_path: Path, monkeypa
     clip_path = viewer_output / "static" / "videos" / video_key / "episode_000001_h264.mp4"
     with av.open(str(clip_path)) as container:
         assert sum(1 for _ in container.decode(video=0)) == 3
+
+    csv_path.write_bytes(b"")
+    clip_path.write_bytes(b"")
+    v3_viewer_module.run_v3_viewer_precompute(
+        root=v3_root,
+        repo_id="local/v3",
+        output_dir=viewer_output,
+        episodes=[0, 1],
+        prepare_videos=True,
+        prepare_csv=True,
+        workers=2,
+        data_version="DVT2",
+    )
+    assert csv_path.stat().st_size > 0
+    with av.open(str(clip_path)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+
     manifest = json.loads((viewer_output / "static" / "viewer_manifest.json").read_text())
     assert manifest["codebase_version"] == "v3.0"
     assert manifest["image_keys"] == [video_key]
@@ -1226,6 +1266,63 @@ def test_v3_delete_episode_rebuilds_shards_and_reindexes(tmp_path: Path):
         0,
         0,
     ]
+
+
+@pytest.mark.parametrize("dataset_format_version", ["v2.1", "v3.0"])
+def test_viewer_single_episode_delete_refreshes_registered_episode_state(
+    tmp_path: Path,
+    monkeypatch,
+    dataset_format_version: str,
+):
+    from flask import Flask
+
+    from lerobot.data_platform import viewer as viewer_module
+
+    root = tmp_path / "source"
+    if dataset_format_version == "v3.0":
+        legacy_root = tmp_path / "legacy_source"
+        _make_dataset(legacy_root)
+        _add_v21_stat_counts(legacy_root)
+        run_convert_v3(legacy_root, root)
+    else:
+        _make_dataset(root)
+        _add_v21_stat_counts(root)
+
+    captured = {}
+    monkeypatch.setattr(Flask, "run", lambda self, **_kwargs: captured.update(app=self))
+    console_static = tmp_path / "vis" / "_console" / "static"
+    console_static.mkdir(parents=True)
+    viewer_module.run_server(
+        dataset=None,
+        episodes=None,
+        max_frames=None,
+        prepare_videos=False,
+        downsample=None,
+        precompute_csv=False,
+        precomputed_only=True,
+        host="127.0.0.1",
+        port=0,
+        static_folder=console_static,
+        template_folder=Path(viewer_module.__file__).parent / "templates",
+        annotate=True,
+        datasets_root=tmp_path,
+    )
+    client = captured["app"].test_client()
+    registered = client.post("/api/datasets/register", json={"root": str(root)}).get_json()["dataset"]
+    dataset_key = registered["key"]
+    assert client.get(f"/api/datasets/{dataset_key}?full=1").get_json()["dataset"]["episodes"] == [0, 1]
+
+    response = client.post(
+        f"/{dataset_key}/delete_episode",
+        json={"episode_id": 0},
+        buffered=True,
+    )
+
+    assert response.status_code == 200
+    assert b"event: done" in response.data
+    refreshed = client.get(f"/api/datasets/{dataset_key}?full=1").get_json()["dataset"]
+    assert refreshed["episodes"] == [0]
+    assert refreshed["episode_count"] == 1
 
 
 def test_v3_construction_and_review_finalize_keep_v3_layout(tmp_path: Path):

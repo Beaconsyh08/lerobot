@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import sys
 from pathlib import Path
@@ -11,6 +12,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from lerobot.data_platform import cli as prepare_script
+from lerobot.data_platform.precompute import annotation as annotation_module
+from lerobot.data_platform.precompute import video as video_module
 from lerobot.data_platform.precompute.analysis import (
     build_dataset_analysis,
     infer_task_scene,
@@ -49,6 +52,227 @@ def _png_bytes(value: int) -> bytes:
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     return encoded.tobytes()
+
+
+class _FakeFfmpegProcess:
+    def __init__(self, command: list[str], *, returncode: int, payload: bytes):
+        self.command = command
+        self.returncode = returncode
+        self.stdin = io.BytesIO()
+        Path(command[-1]).write_bytes(payload)
+
+    def communicate(self):
+        return b"", b"ffmpeg failed" if self.returncode else b""
+
+
+def test_encode_with_ffmpeg_replaces_output_only_after_success(tmp_path: Path, monkeypatch):
+    output = tmp_path / "episode.mp4"
+    output.write_bytes(b"old-cache")
+    commands = []
+
+    def _popen(command, **_kwargs):
+        commands.append(command)
+        return _FakeFfmpegProcess(command, returncode=0, payload=b"new-cache")
+
+    monkeypatch.setattr(video_module.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_module.subprocess, "Popen", _popen)
+
+    assert video_module.encode_with_ffmpeg(
+        output,
+        [np.zeros((2, 2, 3), dtype=np.uint8)],
+        width=2,
+        height=2,
+        fps=30,
+    )
+    assert Path(commands[0][-1]) != output
+    assert Path(commands[0][-1]).suffix == ".mp4"
+    assert output.read_bytes() == b"new-cache"
+    assert not list(tmp_path.glob(".episode.*.mp4"))
+
+
+def test_encode_with_ffmpeg_failure_preserves_existing_output(tmp_path: Path, monkeypatch):
+    output = tmp_path / "episode.mp4"
+    output.write_bytes(b"old-cache")
+
+    def _popen(command, **_kwargs):
+        return _FakeFfmpegProcess(command, returncode=1, payload=b"partial-cache")
+
+    monkeypatch.setattr(video_module.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_module.subprocess, "Popen", _popen)
+
+    assert not video_module.encode_with_ffmpeg(
+        output,
+        [np.zeros((2, 2, 3), dtype=np.uint8)],
+        width=2,
+        height=2,
+        fps=30,
+    )
+    assert output.read_bytes() == b"old-cache"
+    assert not list(tmp_path.glob(".episode.*.mp4"))
+
+
+def test_run_precompute_fails_when_requested_video_cannot_be_encoded(tmp_path: Path, monkeypatch):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text("{}")
+
+    class _Meta:
+        features = {"camera": {"dtype": "image", "shape": [3, 2, 2]}}
+        episodes = {0: {"tasks": ["Pick up the cube"]}}
+
+    monkeypatch.setattr(prepare_script, "load_platform_metadata", lambda *_args, **_kwargs: _Meta())
+    monkeypatch.setattr(prepare_script, "encode_episode_video", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_script, "write_viewer_manifest", lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="episode 0.*camera"):
+        prepare_script.run_precompute(
+            root=root,
+            output_dir=tmp_path / "viewer",
+            prepare_videos=True,
+            prepare_csv=False,
+            prepare_workers=1,
+            show_progress=False,
+        )
+
+
+def test_encode_episode_video_rebuilds_empty_cache(tmp_path: Path, monkeypatch):
+    root = tmp_path / "dataset"
+    parquet_path = root / "data" / "episode.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    parquet_path.write_bytes(b"parquet-placeholder")
+    static_dir = tmp_path / "static"
+    output = static_dir / "videos" / "camera" / "episode_000000_h264.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"")
+
+    class _Meta:
+        fps = 30
+
+        @staticmethod
+        def get_data_file_path(_episode_id):
+            return Path("data/episode.parquet")
+
+    monkeypatch.setattr(video_module, "iter_image_bytes", lambda *_args, **_kwargs: iter([_png_bytes(7)]))
+
+    def _encode(out_path, *_args, **_kwargs):
+        out_path.write_bytes(b"rebuilt-cache")
+        return True
+
+    monkeypatch.setattr(video_module, "encode_with_ffmpeg", _encode)
+
+    result = video_module.encode_episode_video(
+        root,
+        _Meta(),
+        episode_id=0,
+        image_key="camera",
+        static_dir=static_dir,
+        max_frames=None,
+        overwrite=False,
+    )
+
+    assert result == output
+    assert output.read_bytes() == b"rebuilt-cache"
+
+
+def test_empty_csv_cache_is_not_considered_complete(tmp_path: Path):
+    static_dir = tmp_path / "static"
+    csv_path = static_dir / "csv" / "episode_000000_ds1.csv"
+    csv_path.parent.mkdir(parents=True)
+    csv_path.write_bytes(b"")
+
+    assert not prepare_script._all_precomputed_files_exist(
+        static_dir=static_dir,
+        episodes=[0],
+        image_keys=[],
+        prepare_videos=False,
+        prepare_csv=True,
+        downsample=None,
+    )
+
+
+def test_force_recompute_stage_rebuilds_existing_csv(tmp_path: Path, monkeypatch):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text("{}")
+    output_dir = tmp_path / "viewer"
+    csv_path = output_dir / "static" / "csv" / "episode_000000_ds1.csv"
+    csv_path.parent.mkdir(parents=True)
+    csv_path.write_text("cached")
+    calls = []
+
+    class _Meta:
+        features = {}
+        episodes = {0: {"tasks": ["move the cube"]}}
+
+    def _write_csv(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True, None, []
+
+    monkeypatch.setattr(prepare_script, "load_platform_metadata", lambda *_args, **_kwargs: _Meta())
+    monkeypatch.setattr(prepare_script, "write_episode_csv", _write_csv)
+    monkeypatch.setattr(prepare_script, "write_viewer_manifest", lambda **_kwargs: None)
+
+    prepare_script.run_precompute(
+        root=root,
+        output_dir=output_dir,
+        prepare_videos=False,
+        prepare_csv=True,
+        force_recompute_stage=True,
+        show_progress=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0][6] is True
+    assert calls[0][1]["force_recompute_stage"] is True
+
+
+def test_write_parquet_enables_stage_csv_computation(tmp_path: Path, monkeypatch):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text("{}")
+    calls = []
+    written_boundaries = []
+
+    class _Meta:
+        features = {}
+        episodes = {0: {"tasks": ["move the cube"]}}
+
+    boundaries = {
+        "equal_time": True,
+        "num_stages": 2,
+        "stage_boundaries": [0.5],
+    }
+
+    def _write_csv(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True, boundaries, []
+
+    def _write_stage(_root, _meta, values):
+        written_boundaries.append(values)
+        return {}
+
+    monkeypatch.setattr(prepare_script, "load_platform_metadata", lambda *_args, **_kwargs: _Meta())
+    monkeypatch.setattr(prepare_script, "write_episode_csv", _write_csv)
+    monkeypatch.setattr(prepare_script, "write_subtask_state_to_parquet", _write_stage)
+    monkeypatch.setattr(prepare_script, "update_info_features", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prepare_script, "update_episode_stats_for_subtask_state", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(prepare_script, "write_viewer_manifest", lambda **_kwargs: None)
+
+    prepare_script.run_precompute(
+        root=root,
+        output_dir=tmp_path / "viewer",
+        prepare_videos=False,
+        prepare_csv=False,
+        annotate=True,
+        write_parquet=True,
+        show_progress=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0][6] is True
+    assert written_boundaries == [{"0": boundaries}]
 
 
 def test_analysis_prompt_prepositions_distinguish_absolute_and_relative():
@@ -2240,6 +2464,80 @@ def test_write_episode_csv_writes_scalar_exist_label_column(tmp_path: Path):
     assert boundaries is None
     assert issues == []
     assert out_path.read_text().splitlines()[0].split(",") == ["timestamp", "exist_label"]
+
+
+def test_write_episode_csv_rebuilds_empty_cache(tmp_path: Path):
+    dataset_root = tmp_path / "dataset"
+    timestamps = np.array([0.0, 0.1], dtype=np.float32)
+    exist_label = np.array([[0], [1]], dtype=np.int64)
+    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, exist_label=exist_label)
+    features = {
+        "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+        "exist_label": {"dtype": "int32", "shape": [1], "names": None},
+    }
+    meta = DummyMeta(
+        dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the duck"], "length": 2}}
+    )
+    out_path = tmp_path / "static" / "csv" / "episode_000000_ds1.csv"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"")
+
+    ok, _, _ = write_episode_csv(
+        dataset_root,
+        meta,
+        0,
+        out_path,
+        max_frames=None,
+        downsample=None,
+        overwrite=False,
+    )
+
+    assert ok is True
+    assert out_path.read_text().splitlines()[0].split(",") == ["timestamp", "exist_label"]
+
+
+def test_write_episode_csv_failure_preserves_existing_cache(tmp_path: Path, monkeypatch):
+    dataset_root = tmp_path / "dataset"
+    timestamps = np.array([0.0, 0.1], dtype=np.float32)
+    exist_label = np.array([[0], [1]], dtype=np.int64)
+    _write_episode_parquet(dataset_root, 0, timestamps=timestamps, exist_label=exist_label)
+    features = {
+        "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+        "exist_label": {"dtype": "int32", "shape": [1], "names": None},
+    }
+    meta = DummyMeta(
+        dataset_root, features, {0: {"episode_index": 0, "tasks": ["Pick up the duck"], "length": 2}}
+    )
+    out_path = tmp_path / "static" / "csv" / "episode_000000_ds1.csv"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_text("old-cache")
+
+    class _FailingWriter:
+        def __init__(self, file_obj):
+            self.file_obj = file_obj
+
+        def writerow(self, _row):
+            self.file_obj.write("partial-cache")
+            raise RuntimeError("CSV write failed")
+
+        def writerows(self, _rows):
+            raise AssertionError("writerows should not be reached")
+
+    monkeypatch.setattr(annotation_module.csv, "writer", _FailingWriter)
+
+    with pytest.raises(RuntimeError, match="CSV write failed"):
+        write_episode_csv(
+            dataset_root,
+            meta,
+            0,
+            out_path,
+            max_frames=None,
+            downsample=None,
+            overwrite=True,
+        )
+
+    assert out_path.read_text() == "old-cache"
+    assert not list(out_path.parent.glob(".episode_000000_ds1.*.csv"))
 
 
 def test_fix_episode_indices_updates_parquet_and_metadata(tmp_path: Path):

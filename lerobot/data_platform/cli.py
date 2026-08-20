@@ -167,15 +167,19 @@ def _all_precomputed_files_exist(
         downsample_value = downsample if downsample and downsample > 1 else 1
         csv_dir = static_dir / "csv"
         try:
-            csv_names: set[str] = set()
+            csv_sizes: dict[str, int] = {}
             with os.scandir(csv_dir) as it:
                 for entry in it:
                     if entry.is_file():
-                        csv_names.add(entry.name)
+                        try:
+                            csv_sizes[entry.name] = entry.stat().st_size
+                        except OSError:
+                            csv_sizes[entry.name] = 0
         except FileNotFoundError:
             return False
         for episode_id in episodes:
-            if f"episode_{episode_id:06d}_ds{downsample_value}.csv" not in csv_names:
+            size = csv_sizes.get(f"episode_{episode_id:06d}_ds{downsample_value}.csv")
+            if not size or size <= 0:
                 return False
 
     return True
@@ -421,6 +425,12 @@ def run_precompute(
     if write_parquet and not annotate:
         logging.warning("--write-parquet requires --annotate 1. Enabling --annotate automatically.")
         annotate = True
+    if force_recompute_stage or write_parquet:
+        if not prepare_csv:
+            logging.info("Stage computation requires CSV preparation; enabling it automatically.")
+        prepare_csv = True
+        overwrite_csv = True
+        csv_dir.mkdir(parents=True, exist_ok=True)
     _emit_progress(
         progress_callback,
         status="running",
@@ -493,7 +503,7 @@ def run_precompute(
             def _prepare_episode(episode_id: int) -> tuple[int, dict | None, list[dict]]:
                 if prepare_videos:
                     for image_key in image_keys:
-                        encode_episode_video(
+                        video_path = encode_episode_video(
                             root,
                             meta,
                             episode_id,
@@ -502,6 +512,11 @@ def run_precompute(
                             max_frames,
                             overwrite_video,
                         )
+                        if video_path is None:
+                            raise RuntimeError(
+                                f"Failed to prepare video cache for episode {episode_id}, "
+                                f"image key {image_key!r}"
+                            )
 
                 if prepare_csv:
                     downsample_value = downsample if downsample and downsample > 1 else 1
