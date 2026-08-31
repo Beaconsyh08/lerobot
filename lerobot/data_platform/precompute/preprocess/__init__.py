@@ -31,6 +31,7 @@ from lerobot.data_platform.precompute.preprocess.flag_fixes import (
     FLAG_FIX_TRIM_EARLY_GRIPPER,
     load_flagged_episode_ids,
     run_flag_fix,
+    trim_episode_inplace,
     trim_v3_episode_inplace,
 )
 from lerobot.data_platform.precompute.preprocess.prompt_rewrite import (
@@ -83,6 +84,7 @@ __all__ = [
     "run_convert_v3",
     "run_drop_field",
     "run_flag_fix",
+    "trim_episode_inplace",
     "trim_v3_episode_inplace",
     "run_fix_prompt_prepositions",
     "run_lowercase_prompts",

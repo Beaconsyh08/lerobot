@@ -9,6 +9,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.data_profile import (
+    SIGNAL_SCHEMA_TRAIN_16D,
+    resolve_data_profile,
+    write_data_profile,
+)
 from lerobot.data_platform.precompute.dataset_io import is_v3_info
 from lerobot.data_platform.precompute.preprocess.action_dim import _trim_arrow_type
 from lerobot.data_platform.precompute.preprocess.common import (
@@ -27,9 +32,7 @@ from lerobot.data_platform.precompute.preprocess.common import (
 from lerobot.data_platform.precompute.preprocess.field_ops import _drop_field_from_v3_stats
 from lerobot.data_platform.precompute.preprocess.smooth_action import _rewrite_v3_stats
 from lerobot.data_platform.precompute.timeseries import (
-    DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
-    infer_data_version_from_features,
     normalize_gripper_columns,
 )
 
@@ -44,14 +47,6 @@ STANDARDIZE_META = "preprocess_standardize.json"
 
 def default_standardize_path(src_root: Path) -> Path:
     return Path(src_root).expanduser().parent / f"{Path(src_root).name}_preprocessed"
-
-
-def _normalize_data_version(value: str | None, features: dict | None) -> str:
-    if value:
-        normalized = str(value).upper()
-        if normalized in {DATA_VERSION_DVT1, DATA_VERSION_DVT2}:
-            return normalized
-    return infer_data_version_from_features(features)
 
 
 def _is_depth_field(name: str) -> bool:
@@ -244,7 +239,20 @@ def run_standardize_dataset(
 ) -> PreprocessResult:
     src_root = validate_dataset_root(src_root)
     info = load_json(src_root / "meta" / "info.json")
-    data_version = _normalize_data_version(data_version, info.get("features") or {})
+    source_profile = resolve_data_profile(
+        src_root,
+        info.get("features") or {},
+        data_version_override=data_version,
+        default_data_version=DATA_VERSION_DVT2,
+    )
+    data_version = source_profile.legacy_data_version
+    output_profile = source_profile.for_signal_schema(
+        SIGNAL_SCHEMA_TRAIN_16D,
+        gripper_encoding=(
+            "normalized_0_1" if data_version == DATA_VERSION_DVT2 else source_profile.gripper_encoding
+        ),
+        resolution_source="standardize",
+    )
     out_root = _prepare_output_root(
         src_root, out_root or default_standardize_path(src_root), dry_run, overwrite
     )
@@ -263,6 +271,10 @@ def run_standardize_dataset(
         dry_run=dry_run,
         summary={
             "data_version": data_version,
+            "robot_profile": output_profile.robot_profile,
+            "signal_schema": output_profile.signal_schema,
+            "stage_profile": output_profile.stage_profile,
+            "gripper_encoding": output_profile.gripper_encoding,
             "target_dim": TARGET_DIM,
             "drop_depth_suffixes": sorted(DEPTH_FIELD_SUFFIXES),
             "overwrite": overwrite,
@@ -321,7 +333,9 @@ def run_standardize_dataset(
 
     result.summary["dropped_fields"] = sorted(dropped_fields)
     result.summary["dims_after"] = dims_after
-    write_json(out_root / "meta" / "info.json", _update_info(info, dropped_fields))
+    output_info = _update_info(info, dropped_fields)
+    write_data_profile(out_root, output_profile, info=output_info)
+    write_json(out_root / "meta" / "info.json", output_info)
     if is_v3_info(info):
         _rewrite_v3_stats(out_root, stats_by_episode)
         for field_name in dropped_fields:
@@ -340,6 +354,10 @@ def run_standardize_dataset(
             "source_root": str(src_root),
             "output_root": str(out_root),
             "source_data_version": data_version,
+            "robot_profile": output_profile.robot_profile,
+            "signal_schema": output_profile.signal_schema,
+            "stage_profile": output_profile.stage_profile,
+            "gripper_encoding": output_profile.gripper_encoding,
             "target_dim": TARGET_DIM,
             "dropped_fields": sorted(dropped_fields),
             "workers": worker_count,

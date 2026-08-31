@@ -6,6 +6,7 @@ import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -15,6 +16,7 @@ import pyarrow.parquet as pq
 from lerobot.common.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.common.datasets.utils import serialize_dict
 from lerobot.data_platform.precompute.annotation import QUALITY_FLAG_TYPE
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
     is_v3_dataset,
@@ -40,7 +42,7 @@ from lerobot.data_platform.precompute.preprocess.dataset_version import (
     lossless_rgb_h264_options,
 )
 from lerobot.data_platform.precompute.preprocess.quality_flags import QUALITY_FLAGGED_EPISODES
-from lerobot.data_platform.precompute.timeseries import DATA_VERSION_DVT2, infer_data_version_from_features
+from lerobot.data_platform.precompute.timeseries import DATA_VERSION_DVT2
 
 FLAG_FIX_TRIM_EARLY_GRIPPER = "trim_early_gripper_first_frame"
 FLAG_FIX_STUCK_CLOSED_ACTION = "fix_stuck_closed_action"
@@ -357,6 +359,46 @@ def trim_v3_episode_inplace(
     dataset.total_frames = new_meta.total_frames
     _delete_episode_cache(static_dir, int(episode_id))
     return result
+
+
+def trim_episode_inplace(
+    root: Path,
+    episode_id: int,
+    start_frame: int,
+    end_frame: int,
+    *,
+    static_dir: Path | None = None,
+    workers: int = 8,
+) -> dict:
+    """Trim one episode in a materialized v2.1 or v3.0 dataset."""
+    root = validate_dataset_root(Path(root))
+    if not is_v3_dataset(root):
+        return _trim_v21_episode_frames(
+            root,
+            int(episode_id),
+            int(start_frame),
+            int(end_frame),
+        )
+
+    meta = V3DatasetMetadata(f"local/{root.name}", root)
+    dataset = SimpleNamespace(
+        root=root,
+        repo_id=f"local/{root.name}",
+        meta=meta,
+        features=meta.features,
+        fps=meta.fps,
+        total_episodes=meta.total_episodes,
+        total_frames=meta.total_frames,
+    )
+    cache_dir = Path(static_dir or root.parent / "vis" / f"local_vis_{root.name}" / "static")
+    return trim_v3_episode_inplace(
+        dataset,
+        cache_dir,
+        int(episode_id),
+        int(start_frame),
+        int(end_frame),
+        workers=max(1, int(workers or 1)),
+    )
 
 
 def _raw_closed_action_value(action_array: np.ndarray, gripper_index: int, data_version: str) -> float:
@@ -689,9 +731,11 @@ def run_flag_fix(
             dry_run=False,
             summary={**legacy_result.summary, "dataset_format": "v3.0"},
         )
-    selected_data_version = str(
-        data_version or infer_data_version_from_features(info.get("features") or {})
-    ).upper()
+    selected_data_version = resolve_data_profile(
+        root,
+        info.get("features") or {},
+        data_version_override=data_version,
+    ).legacy_data_version
     episode_rows = load_episode_records(root)
     episodes_by_id = {int(row["episode_index"]): row for row in episode_rows}
     meta = V3DatasetMetadata(f"local/{root.name}", root) if source_is_v3 else None

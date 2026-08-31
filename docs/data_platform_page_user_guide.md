@@ -1,38 +1,30 @@
 # Data Platform 页面功能与操作手册
 
-> 适用范围：当前仓库 `lerobot.data_platform` Web 页面，包含首页工作台、Viewer、Analysis、Labeling、Construction、Tagging、Embedding、Smoothing 和 Compare 页面。  
-> 页面默认地址：`http://127.0.0.1:9091`。本文按当前代码整理，更新时间为 2026-08-19。
+> 适用范围：当前仓库 `lerobot.data_platform` Web 页面，包含 Data Platform 与 Data Curation 两个逻辑 Workspace。
+> 页面默认地址：`http://127.0.0.1:9091`。本文按当前代码整理，更新时间为 2026-08-24。
 
 ## 1. 这套页面是做什么的
 
-Data Platform 页面不是单纯的数据浏览器，而是一套本地 LeRobot 数据集工作台，主要完成下面几类工作：
+页面采用同仓库、同进程内的“双平面”结构：
 
-- 注册并管理本地数据集；
-- 生成视频和 CSV 浏览缓存；
-- 查看 episode 的视频、Action、State、Stage、任务和标签；
-- 检测异常 episode，并进行人工标记、修复、裁剪或删除；
-- 标准化、转换、平滑、拆分、合并或相减数据集；
-- 进行目标框标注、自动标签和合成数据构造；
-- 生成数据分析、策略 Embedding 和数据集对比结果；
-- 在右侧统一查看后台任务、产物入口和操作审计记录。
+- **Data Platform**：数据发现、接入、校验、缓存、预处理、不可变版本、血缘和物化执行；
+- **Data Curation**：数据理解、语义质量复核、标注增强、Dataset Profile、Requirement、Recipe、cohort/去留决策和数据集构造；
+- 两者共享顶部 Dataset selector、Viewer、Jobs 抽屉和 Pipeline Runs/Audit。
+
+默认工作流中，Curation 只保存草稿决策，不直接写 Parquet。Manifest 发布后，Platform 在 sibling 路径物化新的数据集版本。
 
 推荐把它理解为下面这条流水线：
 
 ```mermaid
 flowchart LR
-    A[扫描数据根目录] --> B[注册并加载数据集]
-    B --> C[准备视频和 CSV 缓存]
-    C --> D[Viewer / Analysis 检查]
-    D --> E[异常检测与人工复核]
-    E --> F[标准化或其他预处理]
-    F --> G[注册输出数据集]
-    G --> C
-    D --> H[Object Labeling]
-    H --> I[Label Review]
-    I --> J[Data Construction]
-    D --> K[Auto-tagging]
-    K --> L[Tag Review]
-    D --> M[Embedding / Compare]
+    A[Source Delivery] --> B[Platform Ingestion]
+    B --> C[Raw Dataset Version and Reconciliation]
+    C --> D[Platform Preprocessing]
+    D --> E[Standard Dataset Version]
+    E --> F[Profile Requirement and Recipe]
+    F --> G[Curation Workspace and Manifest]
+    G --> H[Platform Materializer]
+    H --> I[Curated Dataset Version]
 ```
 
 ## 2. 启动页面
@@ -71,47 +63,48 @@ ssh -L 9091:127.0.0.1:9091 user@remote-host
 
 | 模式 | 启动参数 | 页面范围 | 是否只读 |
 |---|---|---|---|
-| 完整模式 | `--mode full`，默认 | Preprocess、Annotate、Synthesize、Analyze 全部功能 | 否 |
-| 精简模式 | `--mode visualize` | Cache、Abnormal Flags、Dataset Ops、Viewer、Analysis | **否** |
+| 完整模式 | `--mode full`，默认 | Data Platform 与 Data Curation 全部 Workspace | 默认不修改源版本 |
+| 精简模式 | `--mode visualize` | 精简的浏览、质量与分析入口 | 默认不修改源版本 |
 
-`visualize` 只是减少可见功能，不是只读模式。它仍然允许异常修复、prompt 小写化、清除 flag 和删除 episode。
+两种模式使用相同的正常启动命令，默认隐藏并拦截旧的原地写回入口。点击顶部 `Enter Admin`：首次使用时为当前数据根目录设置管理员密码，以后输入该密码进入 Admin Mode。密码只保存加盐哈希；Admin Mode 没有倒计时，直到主动退出、修改密码或浏览器会话结束。
 
 ## 3. 首页布局和通用操作
 
-首页分为三列：
+首页采用单主画布布局，不再常驻显示数据集左栏和任务右栏：
 
 | 区域 | 用途 |
 |---|---|
-| 左侧 `Datasets` | 扫描、注册、加载、搜索、选择或移除数据集 |
-| 中间功能区 | 执行 Preprocess、Annotate、Synthesize、Analyze 任务 |
-| 右侧 `Job & Artifacts` | 查看任务进度、日志、结果页面和操作历史 |
+| 顶部第一行 | 切换 Data Platform/Data Curation、快速选择当前数据集、查看全局 Job 状态 |
+| 顶部第二行 | 切换 Datasets、Preprocessing、Versions、Pipeline Runs 等功能页 |
+| 主操作区 | 显示当前功能的配置、预览和执行结果 |
+| 底部 Jobs 抽屉 | 按需查看最近任务、实时进度、日志和输出 |
 
 ### 3.1 第一次加载数据集
 
-1. 在左侧 `root_dir` 输入数据集父目录。
+1. 打开 `Data Platform > Datasets`，在 `root_dir` 输入数据集父目录。
 2. 点击 `Scan`。
 3. 切到 `Available`，查看扫描到的目录。
-4. 选择一个或多个数据集，点击 `Register selected`；单个数据集也可点击 `Register / Load`。
-5. 切回 `Registered`，点击数据集名称加载完整元数据。
-6. 选中数据集后，再到中间功能区执行操作。
+4. 选择一个或多个数据集，点击 `Register selected`；单个数据集可点击 `Add to catalog`。
+5. 切回 `Registered`，点击数据集名称将其设为 working dataset。页面自动补取轻量详情，具体操作在执行时按需加载数据，不再需要单独执行 `Load`。
+6. 选中数据集后，通过顶部功能页导航进入所需操作；后续也可使用顶部 Dataset selector 快速切换。
 
-扫描规则主要识别：
+扫描只识别存在 `meta/info.json` 的完整 LeRobot 数据集。cache-only 项目暂不出现在发现、注册和选择界面。
 
-- 存在 `meta/info.json` 的 LeRobot 数据集；
-- 已经存在 Viewer cache、但原始数据集当前不可用的 cache-only 项目。
-
-### 3.2 `Registered`、`Available` 和 `cache-only`
+### 3.2 `Registered`、`Available` 和源数据保护
 
 - `Available`：在 `root_dir` 下扫描到、但尚未注册到当前工作台的目录。
-- `Registered`：已保存到工作台注册表的项目。
-- `cache-only`：只能使用已有可视化缓存，不能执行需要原始 Parquet/视频的数据写回操作。
-- 点击 `remove` 只会从工作台注册表移除，不会删除数据集文件。
+- `Registered`：已保存到工作台 Catalog 的项目；选择后即可使用。
+- `Mark root as source`：将当前路径及其所有子目录视为源数据区，服务器拒绝原地删除、修复和覆盖。
+- `protect`：只保护一个已注册数据集，适合它不在统一源数据路径下的情况。
+- `unregister`：只移除 Catalog 记录，不会删除数据集文件，也不受源数据保护限制。
+
+数据阶段与保护级别是两个独立维度：Raw、Standard、Curated 表示数据处于闭环的哪个阶段；`source protected` 表示是否允许原地修改。Preprocess 输出默认属于 Standard/Managed，只有输出仍位于受保护路径下或被手工标记时才继续受保护。
 
 ### 3.3 通用参数
 
 | 参数 | 含义 | 建议 |
 |---|---|---|
-| `data format` | DVT1 或 DVT2 数据规则 | 能自动识别时保持默认；已知格式时再手动覆盖 |
+| `Robot / Stage profile` | 机器人语义、gripper 解释和 Stage 规则 | 优先读取 `meta/data_profile.json`；维度只用于旧数据兼容推断 |
 | `episodes` | 指定 episode 子集 | 留空表示全部；试跑可填 `0 1 2` |
 | `workers` | 并行 worker 数 | CPU/NFS 忙时调低，避免多个大任务同时跑 |
 | `downsample` | CSV 曲线显示采样步长 | 只影响浏览曲线密度；例如 5 表示每 5 行取 1 行 |
@@ -119,7 +112,22 @@ ssh -L 9091:127.0.0.1:9091 user@remote-host
 | `Dry run only` | 只计算计划和摘要，不真正写入 | 对转换、改名、拆分、合并、相减等操作建议先勾选 |
 | `Overwrite` | 覆盖已有输出或缓存 | 确认输出目录和数据集无误后再启用 |
 
-## 4. 先看清楚：哪些功能会改数据
+## 4. 版本、Manifest 与写入边界
+
+### 4.1 默认推荐路径
+
+1. 在 `Data Platform > Versions & Lineage` 先登记 Source Delivery，再注册当前数据，生成不可变 `DatasetVersion`、完整 Content Manifest、Identity Artifact 和接入对账报告。
+2. Raw → Standard 的组合处理先登记并执行版本化 Preprocessing Profile；workers 等运行参数不会改变 Profile 身份。
+3. 在 Viewer、Quality Review、Annotation 中保存 sidecar 决策。
+4. 为 Standard Version 生成 Dataset Profile，并发布目标数量、覆盖维度和质量约束组成的 Dataset Requirement。
+5. 使用 cohort query、include/exclude、composition、exact dedup 和固定 seed 发布 Data Recipe；Recipe 会冻结为稳定 EpisodeRef 集合。
+6. 将 Recipe 编译为可变 Curation Workspace；Workspace 使用 revision 乐观锁，也可导入已审核的 stage、prompt、bbox、tag 和 flag 证据。
+7. 从 Workspace 执行 validate/review/publish，冻结不可修改的 Published Manifest。
+8. 指定 sibling 输出路径并物化。Platform 按 `Planned → Running → Validating → Committed` 推进，结构、行数、时间戳和全部文件 SHA256 通过后才原子注册 Curated Dataset Version。
+
+`episode_index` 只用于当前版本显示和输入；Workspace/Manifest 持久化为 `dataset_version_id + episode_uid`。UID 位于数据目录外的 Identity Artifact，复制数据时可一并导入；Split/Merge/Profile 通过显式 lineage 保持 UID。
+
+### 4.2 写入范围
 
 | 功能 | 写入位置 | 是否修改源数据集 | 风险等级 |
 |---|---|---:|---|
@@ -128,45 +136,45 @@ ssh -L 9091:127.0.0.1:9091 user@remote-host
 | Analysis、Embedding、Compare | 可视化/分析缓存 | 否 | 低 |
 | Viewer 手工 flag、临时 tag | local_vis sidecar | 否，合并前只在缓存 | 低 |
 | Stage 编辑未完成时保存 | annotation cache 和 CSV | 否 | 中 |
-| Stage 编辑完成后保存 | annotation cache、CSV、源 Parquet/meta/stats | **是** | 高 |
+| Stage/Prompt/Label/Tag 编辑 | local_vis sidecar 与 Curation Workspace | 否 | 低 |
 | Abnormal Flags 检测/清除 | flag 和 issue 缓存 | 通常否 | 中 |
-| Abnormal Flags 一键修复 | 源 Parquet/meta/cache | **是** | 高 |
+| Manifest materialize | 临时目录，成功后发布为 sibling dataset | 否 | 中 |
 | Standardize | 新的 sibling 数据集 | 否 | 中 |
 | Convert action/state、Convert v3、Drop field、Smooth action | 新的 sibling 数据集 | 否 | 中 |
-| Repair v3 video timestamps | 源 MP4 和 v3 episode metadata | **是** | 高 |
-| Rewrite prompts、Fix prepositions、Apply pending prompts | 源 metadata；部分操作还改 Parquet `task_index` | **是** | 高 |
-| Delete episodes、Viewer `DEL`、Trim `Apply` | 源数据集 | **是，且删除不可逆** | 极高 |
+| Repair、Rewrite、Delete、Viewer Trim 等旧入口 | 默认隐藏并由服务器拒绝 | 否 | 禁用 |
 | Split、Merge、Subtract | 新的 sibling 数据集 | 否 | 中 |
 | Object Labeling / Auto-tagging 运行 | local_vis 标注或标签结果 | 否 | 中 |
-| `Merge to metadata` | 源 episode metadata | **是** | 高 |
+| `Merge to metadata` 旧入口 | 默认隐藏并由服务器拒绝 | 否 | 禁用 |
 | Data Construction | 新合成数据集 | 否 | 中 |
-| Construction `Finalize rejected` | 合成输出数据集 | **是，删除已拒绝 episode** | 高 |
+| Construction `Finalize rejected` 旧入口 | 默认隐藏并由服务器拒绝 | 否 | 禁用 |
 
-执行高风险操作前，建议：
+只有在页面通过密码进入 Admin Mode 后，上表旧入口才恢复原来的源数据写入语义。主动退出后，页面会重新隐藏入口，后端接口也会拒绝旧写回请求。启用前建议：
 
-1. 确认右上角当前选中的数据集名称和路径；
+1. 确认顶部 Dataset selector 中当前选中的数据集名称和路径；
 2. 能 dry-run 的操作先 dry-run；
-3. 查看右侧任务摘要和 `output`；
+3. 打开顶部 Jobs 抽屉查看任务摘要和 `output`；
 4. 对原地删除、裁剪、timestamp repair 和 metadata merge 先保留备份；
 5. 等当前任务结束后再启动下一个写任务。
 
-## 5. Preprocess：预处理功能
+删除 Episode 或在 Viewer 原地裁剪帧时，页面会先显示影响数量，要求填写删除原因，并要求输入带数量的确认文本；删除原因、Episode 范围和任务结果会进入现有 Audit Log。`source protected` 数据集即使处于 Admin Mode 也会被服务器拒绝原地删除。
 
-### 5.1 Cache
+## 5. 两个 Workspace 的主要功能
+
+### 5.1 Data Platform — Cache
 
 用途：生成 Viewer 所需的视频和 CSV 缓存，不修改源数据集。
 
 操作步骤：
 
 1. 选择数据集并确保已加载 metadata。
-2. 打开 `Preprocess > Cache`。
+2. 打开 `Data Platform > Preprocessing > Cache`。
 3. 选择数据格式、episode 范围、downsample 和 workers。
 4. 勾选 `Prepare videos`、`Prepare CSV`。
 5. 第一次运行不要勾选覆盖；需要重建时再选：
    - `Recompute all cache`：重建视频和 CSV；
    - `Recompute CSV only`：只重建 CSV，保留视频。
 6. 点击 `Prepare cache`。
-7. 等右侧任务完成后点击 `Viewer`。
+7. 在顶部 Jobs 入口确认任务完成，再到 `Data Curation > Explore` 打开 Viewer。
 
 默认缓存目录是数据集相邻的：
 
@@ -176,7 +184,7 @@ ssh -L 9091:127.0.0.1:9091 user@remote-host
 
 v3.0 数据集使用只读适配器生成 Viewer cache，准备 cache 的过程不会修改 v3 源数据。
 
-### 5.2 Stage & Subtask
+### 5.2 Data Curation — Stage & Subtask
 
 用途：自动计算或人工修订 Stage/Subtask，生成阶段曲线和文本标签。
 
@@ -192,15 +200,15 @@ v3.0 数据集使用只读适配器生成 Viewer cache，准备 cache 的过程�
 | `Overwrite subtask text` | 覆盖已有 subtask 文本列 |
 | `Overwrite parquet labels` | 强制重算并写入 stage/subtask，同时重建 CSV |
 
-推荐用法：
+默认推荐用法：
 
-1. 首次只选择少量 episodes，所有红色写回选项保持关闭。
+1. 首次只选择少量 episodes，生成并检查 sidecar 结果。
 2. 运行后在 Viewer 检查 Stage 曲线和边界。
-3. 确认规则正确后，再按需要启用 Parquet/meta 写回选项。
+3. 确认规则正确后，在 Cohorts & Dataset Build 导入 sidecar 并发布 Manifest。
 
-红色 `Dataset mutations` 中的选项会修改源数据，默认关闭。
+旧的红色 `Dataset mutations` 仅在 Legacy Admin 模式显示；它们会修改源数据。
 
-### 5.3 Abnormal Flags
+### 5.3 Data Curation — Quality Review
 
 用途：扫描 Action、State、`subtask_state` 和 prompt，标记可疑 episode。
 
@@ -216,13 +224,13 @@ v3.0 数据集使用只读适配器生成 Viewer cache，准备 cache 的过程�
 
 操作步骤：
 
-1. 选择 `data format`、workers 和可选 episode 范围。
+1. 确认 `Robot / Stage profile`、workers 和可选 episode 范围。
 2. 如需替换上一次自动检测结果，勾选 `Overwrite previous abnormal results`。
 3. 只有确实要一起移除人工 flag 时，才勾选 `Also clear manual flags`。
 4. 点击 `Detect flags`。
 5. 打开 Viewer，使用 `flagged` 和 flag 类型筛选逐条复核。
 
-一键操作：
+旧流程一键操作（默认隐藏）：
 
 | 按钮 | 作用 | 是否改源数据 |
 |---|---|---:|
@@ -233,11 +241,14 @@ v3.0 数据集使用只读适配器生成 Viewer cache，准备 cache 的过程�
 | `Delete all flagged episodes` | 删除所有当前 flagged episodes | **是，不可逆** |
 | `Clear all flags` | 清除 flag/issue 结果 | 通常不改 Parquet，但会清除复核状态 |
 
-不要把“被 flag”直接等同于“应该删除”。建议先在 Viewer 按原因筛选，再决定修复或删除。
+不要把“被 flag”直接等同于“应该删除”。建议先在 Viewer 按原因筛选，把去留或修复决定写入 Manifest；Platform 物化时才生成新版本。
 
-### 5.4 Standardize
+### 5.4 Data Platform — Standardize
 
-用途：生成训练就绪的 16D Action/State sibling 数据集，源数据集不修改。
+用途：生成统一的 16D Action/State Standard sibling 数据集，源数据集不修改。
+
+这里的 DVT2 表示机器人和 Stage 规则，不表示输出向量维度。Standardize 后机器人仍是 H10W
+DVT2，信号 schema 变为 `dual_arm_standard_16d`；两者分别记录，不再把 16D 输出命名为 DVT1。
 
 标准化流程会：
 
@@ -250,17 +261,21 @@ v3.0 数据集使用只读适配器生成 Viewer cache，准备 cache 的过程�
 
 操作步骤：
 
-1. 打开 `Preprocess > Standardize`。
-2. 选择 DVT1/DVT2 和 workers。
+1. 打开 `Data Platform > Preprocessing > Standardize`。
+2. 确认 source robot profile（当前默认 H10W DVT2）和 workers；只有真实旧机器人数据才选 DVT1 legacy。
 3. 如需仅从输出中排除部分 episode，在 `delete episodes` 填 `1,3-10,12`。
 4. 第一次建议勾选 `Dry run only`。
-5. 确认右侧摘要后取消 dry-run，再运行 `Standardize dataset`。
+5. 在 Jobs 抽屉确认 dry-run 摘要后取消 dry-run，再运行 `Standardize dataset`。
 6. 默认输出为稳定路径 `<src>_preprocessed`；已有目录时必须明确勾选覆盖。
 7. 完成后输出数据集会注册到页面，再对它准备 cache 并复核。
 
-### 5.5 Transform
+输出的 `meta/data_profile.json` 会固定 `robot_profile`、`signal_schema`、`gripper_encoding` 和
+`stage_profile`。复制、重启、Split/Merge 或再次计算 Stage 时均优先使用该画像，不再依赖
+Action/State 的长度猜 DVT1/DVT2。
 
-`Transform` 用于生成 schema/feature 变化后的 sibling 数据集，只有 v3 timestamp repair 是原地修改。
+### 5.5 Data Platform — Transform
+
+`Transform` 用于生成 schema/feature 变化后的 sibling 数据集。v3 timestamp 原地 repair 默认被服务器拦截，只在 Legacy Admin 模式可用。
 
 | 操作 | 用途 | 关键参数 | 输出行为 |
 |---|---|---|---|
@@ -277,9 +292,11 @@ v3 视频编码模式：
 
 `Smooth action` 的 window 必须为奇数。它会平滑所选字段的所有维度；这不是只平滑机械臂、保留 gripper 的专项 trajectory cleanup。
 
-平滑完成后，右侧会出现 `Smoothing report`，可逐 episode、field、dimension 查看 before/after 曲线、RMS delta 和最大绝对变化。
+平滑完成后，Transform 页面顶部和对应 Job 详情会出现 `Smoothing report`，可逐 episode、field、dimension 查看 before/after 曲线、RMS delta 和最大绝对变化。
 
-### 5.6 Dataset Ops
+### 5.6 Legacy Admin — In-place Dataset Ops
+
+本节仅用于兼容旧流程；默认页面不显示，相关请求也会返回 403。正常流程请把 prompt、删除和 repair 决定写入 Manifest。
 
 | 操作 | 用途 | 数据写入 |
 |---|---|---|
@@ -295,7 +312,7 @@ v3 视频编码模式：
 
 删除按照当前数据集删除前的 episode ID 解释，并从高 ID 到低 ID 执行。成功后无法撤销；失败时会尝试恢复删除前快照，但不应把它当作正式备份机制。
 
-### 5.7 Split / Merge / Subtract
+### 5.7 Data Platform — Materialize（Split / Merge / Subtract）
 
 三种操作都生成新数据集，不改源数据集；成功后会自动注册输出。
 
@@ -378,9 +395,16 @@ Viewer 在 cache 准备完成后可打开。页面主要包含视频、时间轴
 - `DEL`：永久删除整个 episode、相关 Parquet/视频/metadata，并重排后续索引；
 - 两者都属于源数据原地修改，不可依赖浏览器撤销。
 
-## 7. Analysis：数据集整体检查
+## 7. Explore 可视化中心与 Analysis
 
-在右侧 `Open > Analysis` 打开。页面会汇总：
+进入 `Data Curation > Explore` 后，默认的 `Overview` 会集中展示 8 类可视化入口：Episode Viewer、Dataset Analysis、Label Review、Tag Review、Construction Review、Embedding Map、Dataset Compare 和 Smoothing Report。
+
+- `Ready`：产物存在，可直接打开；
+- `Needs cache` / `Not generated`：产物尚未生成，按钮会跳到对应的 Cache、Annotation、Dataset Build、Embedding、Compare 或 Transform 配置页；
+- 卡片只负责展示状态和引导准备流程，不会在点击时自动启动后台任务；
+- `visualize` 模式只显示该模式允许访问的 Viewer 与 Analysis，避免暴露被服务端禁用的功能。
+
+Analysis 页面用于数据集整体检查，会汇总：
 
 - episode 数、canonical task 覆盖、CSV cache 覆盖；
 - 总帧数、总时长、tagged episode 数；
@@ -399,7 +423,7 @@ Viewer 在 cache 准备完成后可打开。页面主要包含视频、时间轴
 
 Analysis 依赖 CSV cache。出现 `missing_csv` 或页面没有 episode 行时，先回首页补齐 CSV cache。
 
-## 8. Annotate：标注功能
+## 8. Data Curation：标注功能
 
 ### 8.1 Object Labeling
 
@@ -420,7 +444,7 @@ Analysis 依赖 CSV cache。出现 `missing_csv` 或页面没有 episode 行时�
 3. `run mode=Only missing` 会保留已有结果；`Full rerun` 会替换选中范围的结果。
 4. `Save vis PNG` 保存检测可视化图。
 5. 点击 `Start labeling`。
-6. 完成后打开右侧 `Label review`。
+6. 完成后从 Object Labeling 页面顶部或对应 Job 详情打开 `Label review`。
 
 ### 8.2 Label Review
 
@@ -483,9 +507,9 @@ Tag Review 页面可：
 - `Reset` 回退当前人工修改；
 - `Merge to metadata` 把当前标签写入 v2.1 JSONL 或 v3 Parquet metadata。
 
-cache-only 项目可以 review/save，但不能 merge 到不存在的原始数据集。
+当前 Catalog 只接受包含 `meta/info.json` 的完整数据集，因此 Review 和 metadata merge 总有明确的源数据上下文。
 
-## 9. Synthesize：Data Construction
+## 9. Data Curation：Data Construction
 
 用途：基于已有 Object Labeling 结果，把源 episode 重新组合/重标 task，构造新的负样本或合成数据集。
 
@@ -513,13 +537,13 @@ cache-only 项目可以 review/save，但不能 merge 到不存在的原始数�
 1. 点击 `Preview` 检查 vocabulary、候选数和场景分布。
 2. 为需要的场景填写目标数量和输出路径。
 3. 点击 `Start construction`，生成新的 sibling 数据集。
-4. 打开右侧 `Construction` review 页面。
+4. 从 Data Construction 页面顶部或对应 Job 详情打开 Construction review。
 5. 按场景、缺失对象和决策状态筛选；对每条记录 Accept 或 Reject。
 6. 全部复核后再点击 `Finalize rejected`。
 
 Construction review 快捷键：`j/k` 上下条、`a` 接受、`r` 拒绝、`f` 删除所有已拒绝 episode。`Finalize rejected` 会物理删除合成输出中的 rejected episode，无法撤销，但不会修改源数据集。
 
-## 10. Analyze：Embedding 和 Compare
+## 10. Data Curation：Embedding 和 Compare
 
 ### 10.1 Embedding
 
@@ -552,7 +576,7 @@ workers 通常对应独立 OpenPI 进程；多 GPU 时再提高，先确认单�
 1. 当前选中数据集作为 A。
 2. 在 `Dataset B` 下拉框选择 B。
 3. 点击 `Build compare cache`。
-4. 任务完成后点击右侧 `Compare selected A/B`。
+4. 任务完成后从 Compare 页面顶部或对应 Job 详情打开 Compare result。
 
 Compare 当前生成：
 
@@ -566,11 +590,11 @@ Compare 当前生成：
 
 Compare 页面目前偏审计视图，统计和 overlap 主要以 JSON 展示。
 
-## 11. 右侧 Job & Artifacts
+## 11. Jobs 抽屉与 Pipeline Runs
 
-### 11.1 Current job 和 Logs
+### 11.1 顶部 Job 状态与底部抽屉
 
-同一时间只建议运行一个后台任务。右侧会显示：
+同一时间只建议运行一个后台任务。顶部 `Jobs` 按钮显示运行数量、最近进度或失败状态；点击后从底部展开抽屉，包含：
 
 - 状态、进度百分比、当前步骤；
 - current/total；
@@ -578,11 +602,13 @@ Compare 页面目前偏审计视图，统计和 overlap 主要以 JSON 展示。
 - 输出路径；
 - 实时日志和错误堆栈摘要。
 
+关闭抽屉不会停止任务或轮询。
+
 任务完成后，先确认状态为 `done/success`，再打开新输出或开始下一个写任务。
 
-### 11.2 Open
+### 11.2 结果与产物入口
 
-按钮会根据产物是否存在自动启用：
+`Data Curation > Explore > Overview` 会始终显示当前模式允许访问的可视化卡片，并根据产物状态提供 `Open` 或准备入口；对应功能页顶部和 Job 详情中仍保留就近的结果链接：
 
 - Viewer；
 - Analysis；
@@ -595,9 +621,9 @@ Compare 页面目前偏审计视图，统计和 overlap 主要以 JSON 展示。
 
 按钮显示 `missing` 或禁用时，应先完成对应前置任务，而不是直接拼 URL。
 
-### 11.3 Operation history
+### 11.3 Pipeline Runs 与 Operation history
 
-Operation history 是统一的操作审计记录，可按 status 和 operation 筛选。展开单条记录可查看：
+`Data Platform > Pipeline Runs` 提供最近任务、输出和日志，可按全局/当前数据集及任务状态筛选。Operation history 是统一的操作审计记录，可按 status 和 operation 筛选。展开单条记录可查看：
 
 - 操作时间和 actor；
 - 数据集和 operation；
@@ -617,7 +643,7 @@ Scan → Register/Load → Cache → Viewer → Analysis
 
 整个流程不需要修改源数据。Viewer 中不要打开 EDIT、TRIM 或 DEL。
 
-### 12.2 生成训练就绪数据集
+### 12.2 生成 Standard 数据集
 
 ```text
 Cache → Viewer 初检 → Abnormal Flags → 人工复核
@@ -679,11 +705,11 @@ Auto-tagging trial → Auto-tagging full → Tag Review
 - 优先换一个 output root；
 - 只有明确要替换时才启用 overwrite。
 
-### 页面显示 cache-only
+### 页面提示 `source protected`
 
-- 当前只有 local_vis 产物，原始数据集不可访问；
-- 可以查看 Viewer、部分 review 和分析缓存；
-- 不能可靠执行 Parquet/meta 写回或 merge。
+- Review、Flag、Annotation 和生成 sibling dataset 的操作仍可使用；
+- 删除 episode、原地 value edit、prompt 修复、时间戳修复等写回操作会被服务器拒绝；
+- 若这是手工保护，可在 Datasets 页面取消；若来自路径规则，应将派生输出写到源数据区之外，或取消该 root 的保护策略。
 
 ## 14. 当前实现依据
 
@@ -695,3 +721,4 @@ Auto-tagging trial → Auto-tagging full → Tag Review
 - `lerobot/data_platform/templates/visualize_dataset_*.html`：各复核/分析子页面；
 - `lerobot/data_platform/routes/`：Preprocess、Tagging、Construction、Embedding、Compare 路由；
 - `lerobot/data_platform/precompute/`：实际数据处理、写入和输出逻辑。
+- `docs/data_lifecycle_architecture.md`：双平面 capability matrix、对象契约、接口和物化不变量。

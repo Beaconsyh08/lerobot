@@ -139,8 +139,12 @@
         <button class="good" onclick="saveDecision('accept')">Accept (a)</button>
         <button class="warn" onclick="saveDecision('reject')">Reject (r)</button>
       </div>
+      {% if legacy_mutations_enabled %}
       <button class="gray" style="margin-top:8px" onclick="finalizeRejected()">Finalize rejected (f)</button>
       <div class="shortcuts">Shortcuts: j/k next/prev, a accept, r reject, f finalize.</div>
+      {% else %}
+      <div class="shortcuts">Decisions remain in the Curation workspace. Publish a Manifest to materialize a new version. Shortcuts: j/k next/prev, a accept, r reject.</div>
+      {% endif %}
 	    </div>
 	  </aside>
 	  </div>
@@ -319,7 +323,9 @@ document.addEventListener("keydown", event => {
   if (event.key === "k") selectRecord(currentIndex - 1);
   if (event.key === "a") saveDecision("accept");
   if (event.key === "r") saveDecision("reject");
+  {% if legacy_mutations_enabled %}
   if (event.key === "f") finalizeRejected();
+  {% endif %}
 });
 
 loadRecords().catch(err => {

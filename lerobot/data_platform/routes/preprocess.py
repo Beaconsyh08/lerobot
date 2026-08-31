@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 from flask import jsonify, render_template, request
 
 from lerobot.data_platform.cli import get_default_output_dir, run_precompute
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
     is_v3_dataset,
@@ -58,7 +59,6 @@ from lerobot.data_platform.precompute.preprocess.smooth_action import SMOOTH_ACT
 from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
-    infer_data_version_from_features,
 )
 from lerobot.data_platform.routes.context import RouteContext
 
@@ -102,6 +102,110 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             ctx.jobs_registry[job["id"]] = job
         return job
 
+    def _lifecycle_store():
+        provider = getattr(ctx, "lifecycle_store", None)
+        if provider is None:
+            return None
+        return provider() if callable(provider) else provider
+
+    def _current_or_ingested_version(store, repo_id: str):
+        dataset_key = ctx.repo_key(repo_id)
+        entry = ctx.datasets_index.get(dataset_key)
+        if entry is None:
+            raise KeyError(f"dataset is not registered: {repo_id}")
+        root = Path(entry["root"]).expanduser().resolve()
+        version_at_root = store.version_at_root(root)
+        for version in [version_at_root] if version_at_root is not None else []:
+            try:
+                store.assert_version_current(version)
+            except ValueError:
+                continue
+            return version
+        return store.ingest(root, repo_id, stage="raw", operation="backfill")
+
+    def _register_output_version(result, job: dict):
+        store = _lifecycle_store()
+        if store is None:
+            return None
+        parent_keys = list(job.get("related_dataset_keys") or [])
+        parents = [_current_or_ingested_version(store, str(repo_id)) for repo_id in parent_keys]
+        if not parents:
+            return store.ingest(result.out_root, result.repo_id, stage="raw")
+        summary = dict(getattr(result, "summary", {}) or {})
+        excluded = {}
+        deleted = summary.get("delete_episodes")
+        if len(parents) == 1 and deleted:
+            excluded[parents[0].version_id] = [int(item) for item in deleted]
+        profile = json.loads(
+            json.dumps(
+                {"job_type": job.get("job_type"), "summary": summary},
+                default=str,
+            )
+        )
+        lineage = []
+        parent_by_root = {str(Path(parent.root).resolve()): parent for parent in parents}
+        for item in list(getattr(result, "episode_lineage", None) or []):
+            source_position = item.get("source_position")
+            parent = None
+            if source_position is not None and 0 <= int(source_position) < len(parents):
+                parent = parents[int(source_position)]
+            if parent is None and item.get("source_root"):
+                parent = parent_by_root.get(str(Path(item["source_root"]).resolve()))
+            if parent is None and len(parents) == 1:
+                parent = parents[0]
+            if parent is None:
+                raise ValueError("preprocess result lineage does not identify its source dataset")
+            lineage.append(
+                {
+                    "source_dataset_version_id": parent.version_id,
+                    "source_episode_index": int(item["source_episode_index"]),
+                    "output_episode_index": int(item["output_episode_index"]),
+                }
+            )
+        if not lineage and len(parents) == 1:
+            deleted_indices = {int(item) for item in (summary.get("delete_episodes") or [])}
+            source_indices = [
+                index for index in sorted(parents[0].uid_by_index()) if index not in deleted_indices
+            ]
+            output_indices = sorted(
+                int(item["episode_index"]) for item in load_episode_records(result.out_root)
+            )
+            if len(source_indices) != len(output_indices):
+                raise ValueError(
+                    "preprocess executor changed episode cardinality without explicit lineage"
+                )
+            lineage = [
+                {
+                    "source_dataset_version_id": parents[0].version_id,
+                    "source_episode_index": source_index,
+                    "output_episode_index": output_index,
+                }
+                for source_index, output_index in zip(source_indices, output_indices, strict=True)
+            ]
+        operation = str(getattr(result, "op", None) or job.get("job_type") or "preprocess")
+        parent_stages = {parent.stage for parent in parents}
+        if len(parent_stages) != 1:
+            raise ValueError(f"cannot derive one dataset from mixed lifecycle stages: {parent_stages}")
+        parent_stage = next(iter(parent_stages))
+        output_stage = "curated" if parent_stage == "curated" else "standard"
+        return store.register_derived(
+            result.out_root,
+            result.repo_id,
+            parent_version_ids=[parent.version_id for parent in parents],
+            operation=operation,
+            profile=profile,
+            stage=output_stage,
+            excluded_episode_indices=excluded,
+            episode_lineage=lineage,
+        )
+
+    def _published_version_at(root: Path):
+        store = _lifecycle_store()
+        if store is None:
+            return None
+        resolved = Path(root).expanduser().resolve()
+        return store.version_at_root(resolved)
+
     def _register_output_dataset(result, job: dict) -> None:
         if result.dry_run:
             ctx.finish_job(
@@ -111,6 +215,7 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 output_root=str(result.out_root),
             )
             return
+        version = _register_output_version(result, job)
         dataset = ctx.meta_only_dataset_cls(result.repo_id, root=result.out_root)
         dataset_key = ctx.register_dataset(dataset, get_default_output_dir(result.out_root))
         repo_id = ctx.repo_id_from_key(dataset_key)
@@ -134,6 +239,7 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             total=result.total_episodes or job.get("total") or 1,
             output_root=str(result.out_root),
             output_dataset_key=repo_id,
+            dataset_version_id=version.version_id if version is not None else None,
             viewer_url=f"/{repo_id}/episode_0",
             review_url=f"/{repo_id}/smoothing" if str(result.op).startswith("smooth_action") else None,
         )
@@ -467,6 +573,20 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         dry_run = ctx.bool_option(options, "dry_run", False)
         overwrite = ctx.bool_option(options, "overwrite", False)
         target_root = None if source_is_v3 else (_out_root(options) or default_v3_path(src_root))
+        published_target = _published_version_at(target_root) if target_root is not None else None
+        if published_target is not None and target_root.exists() and not dry_run:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Output path is published dataset version {published_target.version_id}; "
+                            "choose a new sibling output path"
+                        ),
+                        "output_root": str(target_root),
+                    }
+                ),
+                409,
+            )
         if target_root is not None and target_root.exists() and not dry_run and not overwrite:
             return (
                 jsonify(
@@ -499,6 +619,16 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                     dry_run=dry_run,
                     progress_callback=lambda payload: ctx.update_job(job, payload),
                 )
+                version = None
+                if not result.dry_run:
+                    store = _lifecycle_store()
+                    if store is not None and result.summary.get("already_v3"):
+                        version = _current_or_ingested_version(
+                            store,
+                            ctx.repo_id_from_key(dataset_key),
+                        )
+                    elif store is not None:
+                        version = _register_output_version(result, job)
                 output_root = str(result.out_root)
                 if result.summary.get("already_v3"):
                     message = f"Dataset is already v3.0; no conversion is needed: {output_root}"
@@ -513,10 +643,13 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                     current=result.total_episodes or total,
                     total=result.total_episodes or total,
                     output_root=output_root,
+                    dataset_version_id=version.version_id if version is not None else None,
                 )
                 with ctx.jobs_lock:
                     ctx.append_job_log(job, f"Summary: {result.summary}")
-                    if not result.summary.get("already_v3"):
+                    if version is not None:
+                        ctx.append_job_log(job, f"Registered dataset version: {version.version_id}")
+                    elif not result.summary.get("already_v3"):
                         ctx.append_job_log(job, "v3.0 outputs are not auto-registered in the legacy viewer.")
             except Exception as exc:
                 logging.exception("Preprocess convert_v3 failed")
@@ -1106,7 +1239,9 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         output_dir = Path(index_entry["output_dir"]).expanduser()
         try:
             info = load_json(root_path / "meta" / "info.json")
-            default_data_version = infer_data_version_from_features(info.get("features") or {})
+            default_data_version = resolve_data_profile(
+                root_path, info.get("features") or {}
+            ).legacy_data_version
             data_version = _data_version_option(options, default_data_version)
             episodes = ctx.parse_int_list(options.get("episodes") or options.get("episode_ids"))
         except ValueError as exc:
@@ -1260,6 +1395,11 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                 FLAG_FIX_DELETE_ALL_FLAGGED,
             }:
                 raise ValueError(f"Unsupported flag fix: {fix_kind}")
+            reason = str(options.get("reason") or "").strip()
+            if fix_kind == FLAG_FIX_DELETE_ALL_FLAGGED and not reason:
+                raise ValueError("reason is required for deleting flagged episodes")
+            if len(reason) > 500:
+                raise ValueError("reason must be 500 characters or fewer")
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
 
@@ -1272,8 +1412,11 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             return jsonify({"error": str(exc)}), 400
 
         try:
-            info = load_json(Path(dataset_obj.root) / "meta" / "info.json")
-            default_data_version = infer_data_version_from_features(info.get("features") or {})
+            dataset_root = Path(dataset_obj.root)
+            info = load_json(dataset_root / "meta" / "info.json")
+            default_data_version = resolve_data_profile(
+                dataset_root, info.get("features") or {}
+            ).legacy_data_version
             data_version = _data_version_option(options, default_data_version)
             episodes = ctx.parse_int_list(options.get("episodes") or options.get("episode_ids"))
             prepare_workers_key = (
@@ -1332,7 +1475,11 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
                             dataset_key=dataset_key,
                             dataset_root=Path(dataset_obj.root),
                             episode_ids=flagged_ids,
-                            details={"result": delete_result, "job_id": job["id"]},
+                            details={
+                                "result": delete_result,
+                                "job_id": job["id"],
+                                "reason": reason,
+                            },
                         )
                     ctx.finish_job(
                         job,
@@ -1440,8 +1587,13 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
         dry_run = ctx.bool_option(options, "dry_run", False)
         overwrite_output = ctx.bool_option(options, "overwrite_output", False)
         prepare_workers = _positive_int_option(options, "prepare_workers", 8)
+        root_path = Path(index_entry["root"]).expanduser()
         try:
-            standardize_data_version = _data_version_option(options, DATA_VERSION_DVT2)
+            default_standardize_version = resolve_data_profile(
+                root_path,
+                default_data_version=DATA_VERSION_DVT2,
+            ).legacy_data_version
+            standardize_data_version = _data_version_option(options, default_standardize_version)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         try:
@@ -1453,8 +1605,21 @@ def register_preprocess_routes(app, ctx: RouteContext) -> None:
             )
         except ValueError as exc:
             return jsonify({"error": f"invalid delete episodes: {exc}"}), 400
-        root_path = Path(index_entry["root"]).expanduser()
         out_root = _out_root(options) or default_standardize_path(root_path)
+        published_target = _published_version_at(out_root)
+        if published_target is not None and out_root.exists() and not dry_run:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Output path is published dataset version {published_target.version_id}; "
+                            "choose a new sibling output path"
+                        ),
+                        "output_root": str(out_root),
+                    }
+                ),
+                409,
+            )
         job = _new_job("preprocess_standardize", ctx.repo_id_from_key(dataset_key), 100, str(out_root))
 
         def _run_job() -> None:

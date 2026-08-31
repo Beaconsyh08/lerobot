@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile
 
 VIEWER_MANIFEST = "viewer_manifest.json"
 
@@ -50,12 +51,18 @@ def build_viewer_manifest(
         )
 
     features = dict(getattr(meta, "features", {}) or {})
+    data_profile = resolve_data_profile(
+        root,
+        features,
+        data_version_override=data_version,
+    )
     video_keys = list(getattr(meta, "video_keys", []) or [])
     return {
         "version": 1,
         "repo_id": repo_id,
         "root": str(Path(root).expanduser()),
         "data_version": str(data_version),
+        "data_profile": data_profile.to_dict(),
         "fps": int(getattr(meta, "fps", 0) or 0),
         "total_episodes": len(episode_rows),
         "total_frames": int(getattr(meta, "total_frames", 0) or total_frames),

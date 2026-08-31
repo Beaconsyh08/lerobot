@@ -335,10 +335,14 @@
                         :class="trimEnabled ? 'bg-orange-600/80 text-orange-100' : 'bg-slate-700/60 text-slate-400'"
                         x-text="trimEnabled ? 'TRIM ON' : 'TRIM'"
                         title="Toggle trim mode (T)"></button>
-                <button x-show="stageEditEnabled"
+                {% if legacy_mutations_enabled %}
+                <span x-show="adminModeEnabled"
+                      class="rounded border border-red-700 bg-red-950/70 px-2 py-0.5 text-xs font-semibold text-red-100">ADMIN</span>
+                <button x-show="stageEditEnabled && adminModeEnabled"
                         @click="deleteEpisode()"
                         class="px-2 py-0.5 text-xs font-semibold rounded bg-red-900/70 text-red-300 hover:bg-red-800 select-none cursor-pointer"
                         title="Delete this entire episode (irreversible)">DEL</button>
+                {% endif %}
                 <template x-if="trimEnabled && (trimStart !== null || trimEnd !== null)">
                     <div class="flex items-center gap-1">
                         <label class="text-xs text-orange-300 font-mono flex items-center gap-0.5"
@@ -359,9 +363,11 @@
                                    class="w-16 px-0.5 py-0 text-xs bg-slate-800 border border-slate-600 rounded font-mono text-center text-orange-300">
                         </label>
                         <span class="text-[10px] text-slate-500" title="Use arrow Left/Right to nudge selected handle">&#x2194;</span>
-                        <button @click="applyTrim()"
+                        {% if legacy_mutations_enabled %}
+                        <button x-show="adminModeEnabled" @click="applyTrim()"
                                 class="px-2 py-0.5 text-xs font-semibold rounded bg-red-700/80 text-red-100 select-none cursor-pointer"
                                 title="Apply trim (permanently removes frames outside range)">Apply</button>
+                        {% endif %}
                         <button @click="clearTrim()"
                                 class="px-1 py-0.5 text-xs rounded bg-slate-700/60 text-slate-400 select-none cursor-pointer"
                                 title="Clear trim markers">X</button>
@@ -605,7 +611,7 @@
 
                     <div class="grid grid-cols-1 2xl:grid-cols-2 auto-rows-fr gap-2 flex-1 min-h-0">
                         <div class="min-h-0 rounded border border-slate-800 p-2 bg-slate-900/30 flex flex-col">
-                            <p class="text-xs font-medium text-gray-300 mb-1">{{ "Arm Joint Groups + Body Joint Group" if data_version == "DVT2" else "Left/Right Arm Joint Groups A+B (Combined)" }}</p>
+                            <p class="text-xs font-medium text-gray-300 mb-1">{{ "Arm Joint Groups + Body Joint Group" if has_body_joints else "Left/Right Arm Joint Groups A+B (Combined)" }}</p>
                             <div id="graph-arm-joints" class="relative flex-1 min-h-0" @mouseleave="() => {
                                 if (dygraphArmJoints) {
                                     dygraphArmJoints.setSelection(dygraphIndex, undefined, true, true);
@@ -780,6 +786,8 @@
                 videosKeysSelected: [],
                 videoCodecHint: "{{ video_codec_hint }}",
                 dataVersion: {{ data_version | tojson }},
+                hasBodyJoints: {{ has_body_joints | tojson }},
+                hasLegacyFlag: {{ has_legacy_flag | tojson }},
                 imageKeys: {{ image_keys | tojson }},
                 imageUrls: {},
                 imageBaseUrl: "{{ url_for('get_image', dataset_namespace=dataset_namespace, dataset_name=dataset_name) }}",
@@ -813,10 +821,10 @@
                     { id: "left_b", label: "Left Arm Joint Group B", enabled: true },
                     { id: "right_a", label: "Right Arm Joint Group A", enabled: true },
                     { id: "right_b", label: "Right Arm Joint Group B", enabled: true },
-                        ...({{ (data_version == "DVT2") | tojson }} ? [{ id: "body", label: "Body Joint Group", enabled: true }] : []),
+                        ...({{ has_body_joints | tojson }} ? [{ id: "body", label: "Body Joint Group", enabled: true }] : []),
                     {
                         id: "gripper_flag",
-                        label: {{ ("Left/Right Gripper + Stage" if data_version == "DVT2" else "Left/Right Gripper + Flag + Stage") | tojson }},
+                        label: {{ ("Left/Right Gripper + Flag + Stage" if has_legacy_flag else "Left/Right Gripper + Stage") | tojson }},
                         enabled: true
                     },
                 ],
@@ -936,6 +944,8 @@
                 subtaskMergeUrl: "{{ subtask_merge_url }}",
                 annotateToggleUrl: "{{ annotate_toggle_url }}",
                 annotateEnabled: {{ 'true' if annotate_enabled else 'false' }},
+                legacyMutationsEnabled: {{ 'true' if legacy_mutations_enabled else 'false' }},
+                adminModeEnabled: {{ 'true' if legacy_mutations_enabled else 'false' }},
                 stageEditEnabled: {{ 'true' if stage_edit_enabled else 'false' }},
                 currentEpisodeHasIssue: {{ 'true' if current_issue_episode else 'false' }},
                 _dragState: null,
@@ -1131,9 +1141,8 @@
                     const leftBIdx = new Set([3, 4, 5]);
                     const rightAIdx = new Set([8, 9, 10, 14]);
                     const rightBIdx = new Set([11, 12, 13]);
-                    const isDvt2 = this.dataVersion === "DVT2";
-                    const bodyIdx = isDvt2 ? new Set([16, 17, 18]) : new Set();
-                    const gripperFlagIdx = isDvt2 ? new Set([7, 15]) : new Set([7, 15, 16]);
+                    const bodyIdx = this.hasBodyJoints ? new Set([16, 17, 18]) : new Set();
+                    const gripperFlagIdx = this.hasLegacyFlag ? new Set([7, 15, 16]) : new Set([7, 15]);
 
                     const getIndexFromLabel = (label) => {
                         const match = label.match(/(\d+)$/);
@@ -3224,7 +3233,12 @@
                         this.subtaskSaveStatus = 'save failed';
                         return;
                     }
-                    if (this.subtaskComplete && this.subtaskTransitions.length > 0) {
+                    if (
+                        this.legacyMutationsEnabled
+                        && this.adminModeEnabled
+                        && this.subtaskComplete
+                        && this.subtaskTransitions.length > 0
+                    ) {
                         await this.mergeSubtaskAnnotation();
                     }
                     this.originalSubtaskTransitions = this._cloneTransitions(this.subtaskTransitions);
@@ -3349,8 +3363,24 @@
                 },
 
                 async applyTrim() {
+                    if (!this.adminModeEnabled) {
+                        alert('Admin Mode is not active. Enable it from the Data Platform home page first.');
+                        return;
+                    }
                     if (this.trimStart === null && this.trimEnd === null) return;
-                    if (!confirm('This will permanently remove frames outside the trim range and re-encode videos. This cannot be undone. Continue?')) return;
+                    const totalFrames = this.maxTrimFrame() + 1;
+                    const startFrame = this.trimStart === null ? 0 : Number(this.trimStart);
+                    const endFrame = this.trimEnd === null ? this.maxTrimFrame() : Number(this.trimEnd);
+                    const keptFrames = Math.max(0, endFrame - startFrame + 1);
+                    const removedFrames = Math.max(0, totalFrames - keptFrames);
+                    const reason = String(prompt(`Reason for permanently removing ${removedFrames} frames:`) || '').trim();
+                    if (!reason) return;
+                    if (!confirm(
+                        `Trim Episode ${this.currentEpisodeId}: remove ${removedFrames} frames and keep ${keptFrames}?`
+                        + `\n\nReason: ${reason}`
+                        + '\n\nThis rewrites trajectory data and videos and cannot be undone.'
+                    )) return;
+                    if (prompt(`Type TRIM ${removedFrames} to confirm.`) !== `TRIM ${removedFrames}`) return;
                     this.trimApplying = true;
                     this.trimProgressStep = 0;
                     this.trimProgressTotal = 7;
@@ -3359,7 +3389,7 @@
                         const resp = await fetch(this.trimMergeUrl, {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ episode_id: this.currentEpisodeId }),
+                            body: JSON.stringify({ episode_id: this.currentEpisodeId, reason }),
                         });
                         const ct = resp.headers.get('content-type') || '';
                         if (ct.includes('text/event-stream')) {
@@ -3425,10 +3455,18 @@
                 },
 
                 async deleteEpisode() {
-                    if (!confirm(`Delete Episode ${this.currentEpisodeId}? This will permanently remove the parquet, videos, and all metadata for this episode. This cannot be undone.`)) return;
-                    if (!confirm(`Are you REALLY sure? Type OK in next prompt to confirm.`)) return;
-                    const answer = prompt('Type DELETE to confirm deletion of Episode ' + this.currentEpisodeId);
-                    if (answer !== 'DELETE') return;
+                    if (!this.adminModeEnabled) {
+                        alert('Admin Mode is not active. Enable it from the Data Platform home page first.');
+                        return;
+                    }
+                    const reason = String(prompt(`Reason for deleting Episode ${this.currentEpisodeId}:`) || '').trim();
+                    if (!reason) return;
+                    if (!confirm(
+                        `Delete 1 episode (${this.currentEpisodeId})?\n\nReason: ${reason}`
+                        + '\n\nThis permanently removes its parquet, videos, and metadata and cannot be undone.'
+                    )) return;
+                    const answer = prompt(`Type DELETE 1 to confirm deletion of Episode ${this.currentEpisodeId}.`);
+                    if (answer !== 'DELETE 1') return;
                     this.trimApplying = true;
                     this.trimProgressStep = 0;
                     this.trimProgressTotal = 7;
@@ -3437,7 +3475,7 @@
                         const resp = await fetch(this.deleteEpisodeUrl, {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ episode_id: this.currentEpisodeId }),
+                            body: JSON.stringify({ episode_id: this.currentEpisodeId, reason }),
                         });
                         const ct = resp.headers.get('content-type') || '';
                         if (ct.includes('text/event-stream')) {

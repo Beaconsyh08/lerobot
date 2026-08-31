@@ -29,6 +29,7 @@ from lerobot.common.datasets.compute_stats import aggregate_stats
 from lerobot.common.datasets.utils import cast_stats_to_numpy, serialize_dict
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
+    load_episode_records,
     read_episode_frame_image,
     read_episode_table,
     update_episode_metadata,
@@ -1418,6 +1419,10 @@ def run_convert_v3(
                 "already_v3": True,
                 "action": "already_v3",
             },
+            episode_lineage=[
+                {"source_episode_index": index, "output_episode_index": index}
+                for index in sorted(int(item["episode_index"]) for item in load_episode_records(src_root))
+            ],
         )
         emit(
             progress_callback,
@@ -1474,6 +1479,13 @@ def run_convert_v3(
             "tasks": len(tasks),
             "image_video_mode": image_video_mode,
         },
+        episode_lineage=[
+            {
+                "source_episode_index": int(item["episode_index"]),
+                "output_episode_index": int(item["episode_index"]),
+            }
+            for item in episodes
+        ],
     )
     emit(
         progress_callback,

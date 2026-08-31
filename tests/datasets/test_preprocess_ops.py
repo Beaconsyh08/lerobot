@@ -1,5 +1,6 @@
 import io
 import json
+import shutil
 import threading
 import time
 from fractions import Fraction
@@ -13,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
+from lerobot.data_platform import cli as prepare_script
 from lerobot.data_platform.precompute import v3_viewer as v3_viewer_module
 from lerobot.data_platform.precompute.compare.stats import action_stats, metadata_stats
 from lerobot.data_platform.precompute.construction import run_construction
@@ -21,6 +23,13 @@ from lerobot.data_platform.precompute.construction.review import (
 )
 from lerobot.data_platform.precompute.construction.review import (
     save_decision as save_construction_decision,
+)
+from lerobot.data_platform.precompute.data_profile import (
+    SIGNAL_SCHEMA_TRAIN_16D,
+    has_body_joint_dimensions,
+    profile_from_data_version,
+    resolve_data_profile,
+    write_data_profile,
 )
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
@@ -63,6 +72,11 @@ from lerobot.data_platform.precompute.preprocess.quality_flags import (
     apply_task_assignment_choice,
 )
 from lerobot.data_platform.precompute.tagging.runner import run_tagging
+from lerobot.data_platform.precompute.timeseries import (
+    DATA_VERSION_DVT1,
+    DATA_VERSION_DVT2,
+    infer_data_version_from_features,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -1177,6 +1191,65 @@ def test_v3_standardize_prompt_split_merge_and_subtract(tmp_path: Path):
     }
 
 
+def test_v3_full_standardize_writes_stage_with_dvt2_profile(
+    tmp_path: Path,
+    monkeypatch,
+):
+    src = tmp_path / "src"
+    v3 = tmp_path / "v3"
+    _make_dataset(src, task="move duck")
+    _add_v21_stat_counts(src)
+    run_convert_v3(src, v3)
+
+    standardized = run_standardize_dataset(
+        v3,
+        tmp_path / "v3_standardized",
+        data_version=DATA_VERSION_DVT2,
+        workers=1,
+    )
+    observed_stage_profiles = []
+    original_write_episode_csv = prepare_script.write_episode_csv
+
+    def _track_stage_profile(*args, **kwargs):
+        observed_stage_profiles.append(kwargs["data_version"])
+        return original_write_episode_csv(*args, **kwargs)
+
+    monkeypatch.setattr(prepare_script, "write_episode_csv", _track_stage_profile)
+    result = prepare_script.run_precompute(
+        root=standardized.out_root,
+        repo_id=standardized.repo_id,
+        output_dir=tmp_path / "viewer",
+        prepare_videos=False,
+        prepare_csv=True,
+        prepare_workers=2,
+        fix_episode_indices_enabled=True,
+        annotate=True,
+        write_parquet=True,
+        force_recompute_stage=True,
+        write_subtask=True,
+        overwrite_csv=True,
+        show_progress=False,
+    )
+
+    profile = resolve_data_profile(standardized.out_root)
+    assert profile.legacy_data_version == DATA_VERSION_DVT2
+    assert profile.signal_schema == SIGNAL_SCHEMA_TRAIN_16D
+    assert observed_stage_profiles == [DATA_VERSION_DVT2, DATA_VERSION_DVT2]
+    assert set(result.subtask_boundaries) == {"0", "1"}
+
+    refreshed = V3DatasetMetadata(standardized.repo_id, standardized.out_root)
+    for episode_index in (0, 1):
+        table = read_episode_table(standardized.out_root, refreshed, episode_index)
+        assert all(value is not None for value in table["subtask_state"].to_pylist())
+        assert all(value for value in table["subtask"].to_pylist())
+        csv_path = tmp_path / "viewer" / "static" / "csv" / f"episode_{episode_index:06d}_ds1.csv"
+        assert "stage" in csv_path.read_text().splitlines()[0].split(",")
+
+    info = json.loads((standardized.out_root / "meta" / "info.json").read_text())
+    assert info["features"]["subtask_state"]["dtype"] == "int32"
+    assert info["features"]["subtask"]["dtype"] == "string"
+
+
 def test_v3_quality_scan_and_prompt_assignment_only_rewrite_selected_episode(
     tmp_path: Path,
 ):
@@ -1305,16 +1378,43 @@ def test_viewer_single_episode_delete_refreshes_registered_episode_state(
         static_folder=console_static,
         template_folder=Path(viewer_module.__file__).parent / "templates",
         annotate=True,
+        legacy_mutations_enabled=True,
         datasets_root=tmp_path,
     )
     client = captured["app"].test_client()
+    admin_setup = client.post(
+        "/api/admin/setup",
+        json={"password": "viewer-admin-password", "confirm_password": "viewer-admin-password"},
+    )
+    assert admin_setup.status_code == 200
     registered = client.post("/api/datasets/register", json={"root": str(root)}).get_json()["dataset"]
     dataset_key = registered["key"]
     assert client.get(f"/api/datasets/{dataset_key}?full=1").get_json()["dataset"]["episodes"] == [0, 1]
 
-    response = client.post(
+    missing_trim_reason = client.post(
+        f"/{dataset_key}/trim_merge",
+        json={"episode_id": 0},
+    )
+    assert missing_trim_reason.status_code == 400
+    assert "reason is required" in missing_trim_reason.get_json()["error"]
+
+    missing_batch_reason = client.post(
+        "/api/preprocess/delete_episodes/start",
+        json={"dataset_key": dataset_key, "options": {"episodes": "0"}},
+    )
+    assert missing_batch_reason.status_code == 400
+    assert "reason is required" in missing_batch_reason.get_json()["error"]
+
+    missing_reason = client.post(
         f"/{dataset_key}/delete_episode",
         json={"episode_id": 0},
+    )
+    assert missing_reason.status_code == 400
+    assert "reason is required" in missing_reason.get_json()["error"]
+
+    response = client.post(
+        f"/{dataset_key}/delete_episode",
+        json={"episode_id": 0, "reason": "invalid trajectory"},
         buffered=True,
     )
 
@@ -1506,6 +1606,18 @@ def test_standardize_dataset_normalizes_trims_and_drops_depth(tmp_path: Path):
     out_info = json.loads((result.out_root / "meta" / "info.json").read_text())
     assert out_info["features"]["action"]["shape"] == [16]
     assert out_info["features"]["state"]["shape"] == [16]
+    assert infer_data_version_from_features(out_info["features"]) == DATA_VERSION_DVT1
+    data_profile = resolve_data_profile(result.out_root, out_info["features"])
+    assert data_profile.legacy_data_version == DATA_VERSION_DVT2
+    assert data_profile.robot_profile == "h10w_dvt2"
+    assert data_profile.signal_schema == SIGNAL_SCHEMA_TRAIN_16D
+    assert data_profile.stage_profile == "h10w_dvt2_stage_v1"
+    assert data_profile.gripper_encoding == "normalized_0_1"
+    assert not has_body_joint_dimensions(out_info["features"])
+    assert (result.out_root / "meta" / "data_profile.json").is_file()
+    replica_root = tmp_path / "standardized_replica"
+    shutil.copytree(result.out_root, replica_root)
+    assert resolve_data_profile(replica_root).legacy_data_version == DATA_VERSION_DVT2
     assert out_info["features"]["exist_label"] == {"dtype": "int32", "shape": [1], "names": None}
     assert "head_depth" not in out_info["features"]
     assert "observation.images.left_wrist_depth" not in out_info["features"]
@@ -1526,6 +1638,27 @@ def test_standardize_dataset_normalizes_trims_and_drops_depth(tmp_path: Path):
         if line.strip()
     ]
     assert stats_rows[0]["stats"]["exist_label"]["min"] == [1.0]
+    quality = run_quality_flag_detection(result.out_root, tmp_path / "quality", workers=1)
+    assert quality.summary["data_version"] == DATA_VERSION_DVT2
+
+
+def test_merge_rejects_equal_dimensions_with_different_robot_profiles(tmp_path: Path):
+    dvt1 = tmp_path / "dvt1"
+    dvt2 = tmp_path / "dvt2"
+    _make_dataset(dvt1)
+    _make_dataset(dvt2)
+    for root, data_version in ((dvt1, DATA_VERSION_DVT1), (dvt2, DATA_VERSION_DVT2)):
+        info = json.loads((root / "meta" / "info.json").read_text())
+        profile = profile_from_data_version(
+            data_version,
+            info["features"],
+            resolution_source="test",
+            confirmed=True,
+        )
+        write_data_profile(root, profile)
+
+    with pytest.raises(ValueError, match="data profile mismatch"):
+        run_merge([dvt1, dvt2], tmp_path / "merged", dry_run=True)
 
 
 def test_standardize_dataset_preserves_existing_exist_label(tmp_path: Path):

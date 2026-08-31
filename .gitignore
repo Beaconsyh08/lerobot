@@ -117,6 +117,9 @@ db.sqlite3-journal
 instance/
 .webassets-cache
 
+# Data Platform local authentication state
+**/vis/_console/admin_auth.json
+
 # Scrapy stuff:
 .scrapy
 
@@ -186,3 +189,4 @@ urdf
 
 # Local Codex and scratch files
 /.codex
+AGENTS.md

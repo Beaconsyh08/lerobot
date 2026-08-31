@@ -9,6 +9,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile, write_data_profile
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
     ProgressCallback,
@@ -57,9 +58,10 @@ def _feature_signature(feature: dict) -> tuple[str, tuple]:
     return _feature_dtype(feature), _feature_shape(feature)
 
 
-def _validate_compatible(roots: list[Path], infos: list[dict]) -> None:
+def _validate_compatible(roots: list[Path], infos: list[dict]):
     base = infos[0]
     base_features = base.get("features") or {}
+    base_profile = resolve_data_profile(roots[0], base_features)
     for root, info in zip(roots[1:], infos[1:], strict=False):
         if info.get("robot_type") != base.get("robot_type"):
             raise ValueError(
@@ -86,6 +88,20 @@ def _validate_compatible(roots: list[Path], infos: list[dict]) -> None:
                 f"{root} has dtype={_feature_dtype(feature)} shape={list(shape)}; "
                 "please standardize datasets first or merge only compatible datasets"
             )
+        profile = resolve_data_profile(root, features)
+        semantic_fields = ("robot_profile", "signal_schema", "gripper_encoding", "stage_profile")
+        mismatches = [
+            field
+            for field in semantic_fields
+            if getattr(profile, field) != getattr(base_profile, field)
+        ]
+        if mismatches:
+            details = ", ".join(
+                f"{field}: {getattr(base_profile, field)} != {getattr(profile, field)}"
+                for field in mismatches
+            )
+            raise ValueError(f"dataset data profile mismatch for {root}: {details}")
+    return base_profile
 
 
 def _build_task_map(roots: list[Path]) -> tuple[list[dict], dict[str, dict[int, int]]]:
@@ -671,6 +687,7 @@ def run_merge(
         raise ValueError("merge requires at least two source datasets")
     out_root = ensure_output_root(out_root or default_preprocess_path(roots[0], _default_op), dry_run)
     infos = [load_json(root / "meta" / "info.json") for root in roots]
+    output_profile = _validate_compatible(roots, infos)
     v3_positions = [position for position, root in enumerate(roots) if detect_dataset_version(root) == V30]
     if v3_positions:
         source_info = infos[v3_positions[0]]
@@ -722,6 +739,9 @@ def run_merge(
                     workers=max(1, int(workers or 1)),
                     progress_callback=progress_callback,
                 )
+                converted_info = load_json(out_root / "meta" / "info.json")
+                write_data_profile(out_root, output_profile, info=converted_info)
+                write_json(out_root / "meta" / "info.json", converted_info)
             return PreprocessResult(
                 op=_op,
                 src_roots=roots,
@@ -731,8 +751,8 @@ def run_merge(
                 total_frames=legacy_result.total_frames,
                 dry_run=dry_run,
                 summary=summary,
+                episode_lineage=list(legacy_result.episode_lineage),
             )
-    _validate_compatible(roots, infos)
     merged_features = _merge_features(infos)
     merged_tasks, task_maps = _build_task_map(roots)
     exclude_by_root = _normalize_exclude_episodes(roots, exclude_episodes)
@@ -763,6 +783,15 @@ def run_merge(
             },
             **(_summary_extra or {}),
         },
+        episode_lineage=[
+            {
+                "source_position": src_pos,
+                "source_root": str(root),
+                "source_episode_index": old_idx,
+                "output_episode_index": new_idx,
+            }
+            for src_pos, root, old_idx, new_idx in episode_map
+        ],
     )
     emit(
         progress_callback,
@@ -778,6 +807,7 @@ def run_merge(
     try:
         info = update_info_counts(infos[0], len(episodes_out), total_frames, len(merged_tasks))
         info["features"] = merged_features
+        write_data_profile(out_root, output_profile, info=info)
         write_json(out_root / "meta" / "info.json", info)
         write_jsonl(out_root / "meta" / "tasks.jsonl", merged_tasks)
         write_jsonl(out_root / "meta" / "episodes.jsonl", episodes_out)

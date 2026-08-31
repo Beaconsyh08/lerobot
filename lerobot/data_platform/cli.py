@@ -40,6 +40,7 @@ from lerobot.data_platform.precompute.construction import (
     default_synthetic_path,
     run_construction,
 )
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile
 from lerobot.data_platform.precompute.dataset_io import V3DatasetMetadata, is_v3_dataset
 from lerobot.data_platform.precompute.embedding import EmbeddingResult, run_embedding
 from lerobot.data_platform.precompute.labeling import (
@@ -88,7 +89,6 @@ from lerobot.data_platform.precompute.tagging import (
 from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
-    infer_data_version_from_features,
 )
 from lerobot.data_platform.precompute.v3_viewer import run_v3_viewer_precompute
 from lerobot.data_platform.precompute.video import encode_episode_video
@@ -121,12 +121,7 @@ def get_default_output_dir(root: Path) -> Path:
 
 
 def infer_data_version_from_root(root: Path) -> str:
-    info_path = Path(root) / "meta" / "info.json"
-    try:
-        info = json.loads(info_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return DATA_VERSION_DVT1
-    return infer_data_version_from_features(info.get("features") or {})
+    return resolve_data_profile(root).legacy_data_version
 
 
 def load_platform_metadata(root: Path, repo_id: str):
@@ -370,7 +365,11 @@ def run_precompute(
     repo_id = repo_id or f"local/{root.name or 'dataset'}"
     source_is_v3 = is_v3_dataset(root)
     meta = load_platform_metadata(root, repo_id)
-    data_version = str(data_version or infer_data_version_from_features(meta.features)).upper()
+    data_version = resolve_data_profile(
+        root,
+        meta.features,
+        data_version_override=data_version,
+    ).legacy_data_version
     if data_version not in {DATA_VERSION_DVT1, DATA_VERSION_DVT2}:
         raise ValueError(f"Unsupported data_version: {data_version}")
 
@@ -452,23 +451,6 @@ def run_precompute(
         )
     )
     prepared = bool(needs_prepare)
-    if source_is_v3 and needs_prepare and (prepare_videos or prepare_csv):
-        run_v3_viewer_precompute(
-            root=root,
-            repo_id=repo_id,
-            episodes=episodes,
-            output_dir=output_dir,
-            prepare_videos=prepare_videos,
-            prepare_csv=prepare_csv,
-            workers=prepare_workers,
-            downsample=downsample,
-            overwrite_videos=overwrite_video,
-            overwrite_csv=overwrite_csv,
-            data_version=data_version,
-            progress_callback=progress_callback,
-        )
-        needs_prepare = False
-
     _emit_progress(
         progress_callback,
         status="running",
@@ -492,6 +474,26 @@ def run_precompute(
     all_boundaries: dict[str, dict] = {}
     all_issues: list[dict] = []
 
+    if source_is_v3 and needs_prepare and (prepare_videos or prepare_csv):
+        # v3.0 data/video files can contain multiple episodes in one shard. Let
+        # the v3 viewer executor prepare videos and its manifest, then use the
+        # shared episode-aware CSV writer below for both plot data and Stage.
+        run_v3_viewer_precompute(
+            root=root,
+            repo_id=repo_id,
+            episodes=episodes,
+            output_dir=output_dir,
+            prepare_videos=prepare_videos,
+            prepare_csv=False,
+            workers=prepare_workers,
+            downsample=downsample,
+            overwrite_videos=overwrite_video,
+            overwrite_csv=False,
+            data_version=data_version,
+            progress_callback=progress_callback,
+        )
+        needs_prepare = prepare_csv
+
     if needs_prepare:
         if prepare_videos or prepare_csv:
             progress = (
@@ -501,7 +503,7 @@ def run_precompute(
             )
 
             def _prepare_episode(episode_id: int) -> tuple[int, dict | None, list[dict]]:
-                if prepare_videos:
+                if prepare_videos and not source_is_v3:
                     for image_key in image_keys:
                         video_path = encode_episode_video(
                             root,
@@ -645,16 +647,17 @@ def run_precompute(
         )
         written = write_subtask_text_to_parquet(root, meta, episodes)
         logging.info("Wrote subtask text for %d episodes", written)
-        update_info_features(
-            root,
-            {
-                "subtask": {
-                    "dtype": "string",
-                    "shape": [1],
-                    "names": None,
-                }
-            },
-        )
+        if written:
+            update_info_features(
+                root,
+                {
+                    "subtask": {
+                        "dtype": "string",
+                        "shape": [1],
+                        "names": None,
+                    }
+                },
+            )
 
     if not source_is_v3:
         try:
@@ -974,7 +977,10 @@ def main():
         type=str,
         choices=[DATA_VERSION_DVT1, DATA_VERSION_DVT2],
         default=None,
-        help="Override inferred dataset schema version. By default this is inferred from action/state dimensions.",
+        help=(
+            "Override the robot/Stage profile. By default the portable dataset profile is used; "
+            "dimensions are only a legacy fallback."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -1501,8 +1507,9 @@ def main():
         choices=["full", "visualize"],
         default="full",
         help=(
-            "Home console feature set. Use 'visualize' for Cache, Abnormal Flags, Dataset Ops, "
-            "and viewer/analysis. It is not read-only; default keeps the full data platform."
+            "Home console feature set. 'full' exposes Data Platform and Data Curation; "
+            "'visualize' keeps the reduced review surface. Unlock legacy in-place mutations "
+            "from the page with the local administrator password."
         ),
     )
     parser.add_argument(
@@ -1510,6 +1517,23 @@ def main():
         dest="console_mode",
         choices=["full", "visualize"],
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--enable-legacy-mutations",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--protected-source-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Protect every dataset below this path from in-place mutation. "
+            "Repeat the option to configure multiple source roots."
+        ),
     )
     parser.add_argument(
         "--serve",
@@ -1563,6 +1587,8 @@ def main():
             annotate=False,
             datasets_root=datasets_root,
             console_mode=args.console_mode,
+            legacy_mutations_enabled=bool(args.enable_legacy_mutations),
+            protected_source_roots=args.protected_source_root,
         )
         return
 

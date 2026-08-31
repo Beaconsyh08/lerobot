@@ -373,11 +373,12 @@ def test_delete_all_flagged_refreshes_viewer_episode_state_before_job_finishes(
     monkeypatch.setattr(preprocess_routes.threading, "Thread", _ImmediateThread)
     app = Flask(__name__)
     ctx = _route_context(src_root)
+    audit = {}
     ctx.ensure_dataset_loaded = lambda _key: (dataset, static_dir)
     ctx.parse_int_list = lambda value: value
     ctx.clear_dataset_caches = None
     ctx.refresh_dataset_after_episode_delete = refresh_viewer
-    ctx.append_operation_log = None
+    ctx.append_operation_log = lambda *_args, **kwargs: audit.update(kwargs)
     original_finish_job = ctx.finish_job
 
     def finish_job(job, message, **updates):
@@ -387,11 +388,24 @@ def test_delete_all_flagged_refreshes_viewer_episode_state_before_job_finishes(
     ctx.finish_job = finish_job
     preprocess_routes.register_preprocess_routes(app, ctx)
 
-    response = app.test_client().post(
+    missing_reason = app.test_client().post(
         "/api/preprocess/flag_fixes/start",
         json={
             "dataset_key": "local/source",
             "options": {"fix_kind": "delete_all_flagged"},
+        },
+    )
+    assert missing_reason.status_code == 400
+    assert "reason is required" in missing_reason.get_json()["error"]
+
+    response = app.test_client().post(
+        "/api/preprocess/flag_fixes/start",
+        json={
+            "dataset_key": "local/source",
+            "options": {
+                "fix_kind": "delete_all_flagged",
+                "reason": "corrupted collection batch",
+            },
         },
     )
 
@@ -400,6 +414,7 @@ def test_delete_all_flagged_refreshes_viewer_episode_state_before_job_finishes(
     assert job["status"] == "done"
     assert job["viewer_url"] == "/local/source/episode_0"
     assert events == ["delete", "refresh", "finish"]
+    assert audit["details"]["reason"] == "corrupted collection batch"
 
 
 def test_convert_v3_homepage_wiring():
@@ -427,7 +442,7 @@ def test_convert_v3_homepage_wiring():
     assert "/api/preprocess/repair_v3_video_timestamps/start" in template
     assert "Videos are not re-encoded." in template
     assert "224×224" not in template
-    assert "activeJob.output_root" in template
+    assert "selectedJob().output_root" in template
     assert "Dataset is already v3.0; no conversion is needed." in template
     assert "selectedDatasetIsV3()" in template
     assert "v3.0 viewer support uses a read-only adapter in this environment." in template

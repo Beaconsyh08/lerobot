@@ -10,6 +10,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from lerobot.data_platform.precompute.annotation import QUALITY_FLAG_TYPE, compute_quality_flags, series_to_2d
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
     is_v3_dataset,
@@ -34,7 +35,6 @@ from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
     feature_vector_dim,
-    infer_data_version_from_features,
 )
 
 QUALITY_FLAGGED_EPISODES = "quality_flagged_episodes.json"
@@ -1045,9 +1045,11 @@ def run_quality_flag_detection(
     root = validate_dataset_root(Path(root))
     static_dir = Path(static_dir).expanduser()
     info = load_json(root / "meta" / "info.json")
-    selected_data_version = str(
-        data_version or infer_data_version_from_features(info.get("features") or {})
-    ).upper()
+    selected_data_version = resolve_data_profile(
+        root,
+        info.get("features") or {},
+        data_version_override=data_version,
+    ).legacy_data_version
     if selected_data_version not in {DATA_VERSION_DVT1, DATA_VERSION_DVT2}:
         raise ValueError(f"Unsupported data_version: {selected_data_version}")
 

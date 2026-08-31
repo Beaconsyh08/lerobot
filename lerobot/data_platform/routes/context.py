@@ -36,6 +36,9 @@ class RouteContext:
     clear_dataset_caches: Callable[[tuple[str, str] | None], None] | None = None
     refresh_dataset_after_episode_delete: Callable[[tuple[str, str], object, Path], list[int]] | None = None
     static_dir_for_key: Callable[[tuple[str, str]], Path | None] | None = None
+    lifecycle_store: Callable[[], object] | object | None = None
+    legacy_mutations_enabled: bool = False
+    dataset_is_protected: Callable[[tuple[str, str]], bool] | None = None
 
     def update_job(self, job: dict, payload: dict) -> None:
         with self.jobs_lock:

@@ -52,15 +52,16 @@ Start the platform with a directory containing one or more local datasets:
 python -m lerobot.data_platform --root /path/to/datasets
 ```
 
-The home page recursively discovers directories containing `meta/info.json`. After selecting a
-dataset, prepare its viewer cache if needed and use the navigation tabs for visualization,
-quality review, labeling, tagging, processing, comparison, embedding, and construction. All
-dataset operations are configured, started, and reviewed from the UI.
+The home page recursively discovers directories containing `meta/info.json` and exposes two
+logical workspaces in the same process:
 
-This fork includes a browser-based Data Platform for understanding, reviewing, and processing
-local LeRobot datasets. It brings dataset discovery, visualization, quality control, annotation,
-transformation, analysis, and dataset construction into one UI. The implementation lives in
-[`lerobot/data_platform`](lerobot/data_platform).
+- **Data Platform** is the supply and execution plane for ingestion, preprocessing, immutable
+  dataset versions, lineage, and materialization.
+- **Data Curation** is the decision plane for exploration, quality review, annotation, cohort
+  selection, profiling, versioned requirements/recipes, and dataset construction.
+
+The two workspaces continue to share the dataset selector, Viewer, Job & Artifacts panel, and
+operation audit log. The implementation lives in [`lerobot/data_platform`](lerobot/data_platform).
 
 The platform always operates on real LeRobot metadata and trajectory data. It reports invalid
 inputs instead of replacing them with fabricated samples. Data Construction also preserves the
@@ -71,27 +72,34 @@ bookkeeping indices, and `exist_label`.
 
 ```mermaid
 flowchart LR
-    A[Local LeRobot datasets] --> B[Data Platform home]
-    B --> C[Explore and cache]
-    B --> D[Quality and annotation]
-    B --> E[Data processing]
-    B --> F[Analysis and construction]
-    C --> G[Episode viewer and plotting assets]
-    D --> H[Reviewed flags, labels, tags, and prompts]
-    E --> I[New datasets or explicit source repairs]
-    F --> J[Reports, comparisons, embeddings, and constructed datasets]
+    A[Source Delivery] --> B[Platform Ingestion]
+    B --> C[Raw Dataset Version and Reconciliation]
+    C --> D[Platform Preprocessing]
+    D --> E[Standard Dataset Version]
+    E --> F[Profile Requirement and Recipe]
+    F --> G[Curation Review and Manifest]
+    G --> H[Platform Materializer]
+    H --> I[Curated Dataset Version and Export]
 ```
+
+Published raw, standard, and curated dataset versions are immutable. Stable `episode_uid` values
+live in portable Identity Artifacts outside dataset roots; physical copies are registered as
+`DatasetReplica` records. Curation edits first live in revision-controlled Workspaces and are
+frozen into versioned manifests. Versioned preprocessing/materialization Profiles separate
+content-affecting configuration from runtime options. The materializer is idempotent, persists its
+state in SQLite, validates row counts, timestamps, metadata, and complete file SHA256 values, then
+atomically registers the logical version and output replica.
 
 ### Modules and capabilities
 
-| Area | Main modules | What the UI can do |
+| Domain | Main modules | What the UI can do |
 | --- | --- | --- |
-| Dataset access and visualization | `viewer.py`, `routes/`, `templates/` | Discover datasets below a root directory, register them in the home console, prepare video and time-series caches, inspect synchronized camera streams, plot state/action signals, and review task or stage information episode by episode. |
-| Quality control and annotation | `precompute/annotation.py`, `precompute/preprocess/quality_flags.py` | Detect timestamp, action, state, stage, task-assignment, and prompt-quality problems; collect abnormal episodes; edit stage boundaries; and review or repair detected issues from the UI. |
-| Object labeling and semantic tagging | `precompute/labeling/`, `precompute/tagging/` | Locate task objects with detector or VLM backends, review bounding boxes, assign rule-based/geometric/VLM tags, and merge approved labels or tags into dataset metadata. |
-| Data processing | `precompute/preprocess/` | Transform feature dimensions, remove fields, smooth action/state signals, standardize dataset structure, split by episode or task, merge datasets, subtract duplicate episodes, repair indices/flags/prompts, and delete selected episodes. |
-| Dataset understanding | `precompute/analysis.py`, `precompute/compare/`, `precompute/embedding/` | Summarize task composition and durations, inspect label distributions, compare statistics and episode overlap between datasets, and project policy/statistical embeddings for visual exploration. |
-| Data Construction | `precompute/construction/` | Build and review positive/negative training variants by relabeling real source trajectories. Observation and action values are preserved; only labels, task metadata, and required bookkeeping are rewritten. |
+| Platform — ingestion and versions | `lifecycle.py`, `lifecycle_repository.py`, `routes/lifecycle.py` | Full-hash local datasets, register immutable versions/replicas and portable identity artifacts, inspect explicit episode lineage. |
+| Platform — delivery and reconciliation | `lifecycle.py`, `routes/lifecycle.py` | Register source deliveries and explain every received/accepted/excluded/repaired/generated Episode transition. |
+| Platform — preprocessing and materialization | `precompute/preprocess/`, `lifecycle.py` | Execute versioned Profiles and idempotently materialize a published manifest through a persisted validation state machine. |
+| Curation — understand and quality | `viewer.py`, `precompute/analysis.py`, `precompute/compare/`, `precompute/embedding/`, `precompute/preprocess/quality_flags.py` | Explore trajectories, distributions, embeddings, comparisons, technical issues, and semantic quality evidence. |
+| Curation — enrichment and selection | `precompute/annotation.py`, `precompute/labeling/`, `precompute/tagging/`, `precompute/construction/` | Edit revision-controlled Workspaces containing stage, prompt, bbox, tag, include/exclude, trim, and value-edit decisions before publishing a manifest. |
+| Curation — profile and recipe | `lifecycle.py`, `routes/lifecycle.py` | Publish Dataset Profiles and Requirements, resolve fixed cohorts, and compile deterministic Recipes into reviewable Workspaces. |
 
 The data-processing area is divided into smaller modules:
 
@@ -104,13 +112,29 @@ The data-processing area is divided into smaller modules:
 | Quality and metadata repair (`quality_flags.py`, `flag_fixes.py`, `flag_clear.py`, `prompt_rewrite.py`) | Detect data-quality problems, apply supported repairs, review task/prompt assignments, and clear resolved flags. |
 | Episode maintenance (`delete_episodes.py`) | Delete selected episodes in place, reindex the remaining data and metadata, and attempt rollback if the operation fails. |
 
-Data-processing actions have different write scopes:
+The default console path does not expose direct source-dataset mutation controls. Cache,
+analysis, Workspaces, manifests, and lifecycle records live outside the source dataset; preprocessing
+and materialization create sibling outputs. The normal startup command also provides a password-
+protected Admin Mode in the browser. On first entry, set the local administrator password for that
+dataset root; later entries require the same password. The password is stored only as a salted hash,
+and Admin Mode remains active until explicitly exited or the browser session ends. Episode deletion
+requires an impact confirmation and a reason recorded in the operation audit log.
 
-- Cache preparation and analysis write viewer assets outside the source dataset.
-- Split, merge, subtract, smoothing, field conversion, and standardization create output datasets.
-- Prompt/flag repair, parquet writeback, and episode deletion explicitly modify the source dataset.
-- Episode deletion uses best-effort rollback, not an isolated filesystem transaction; concurrent
-  writers to the same dataset are unsupported.
+To mark one or more read-only source zones at startup, repeat `--protected-source-root`. The console
+also exposes the same policy on the Datasets page. Protected datasets can be reviewed and used to
+create sibling outputs, but every legacy in-place delete, repair, or overwrite request is rejected.
+
+```bash
+python -m lerobot.data_platform \
+  --root /path/to/datasets \
+  --protected-source-root /path/to/raw_data
+```
+
+Admin Mode can modify or delete source Parquet, videos, and metadata and should not be used for
+normal curation work.
+
+See [`docs/data_lifecycle_architecture.md`](docs/data_lifecycle_architecture.md) for the capability
+matrix, persisted contracts, API mapping, lifecycle states, and materialization invariants.
 
 
 ## Installation

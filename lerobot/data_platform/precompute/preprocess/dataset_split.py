@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from lerobot.data_platform.precompute.data_profile import resolve_data_profile, write_data_profile
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
     ProgressCallback,
@@ -135,6 +136,7 @@ def run_split(
 ) -> PreprocessResult:
     src_root = validate_dataset_root(src_root)
     out_root = ensure_output_root(out_root or default_preprocess_path(src_root, "split"), dry_run)
+    source_profile = resolve_data_profile(src_root)
     if detect_dataset_version(src_root) == V30:
         source_info = load_json(src_root / "meta" / "info.json")
         with tempfile.TemporaryDirectory(
@@ -177,6 +179,9 @@ def run_split(
                     workers=DEFAULT_V3_CONVERT_WORKERS,
                     progress_callback=progress_callback,
                 )
+                converted_info = load_json(out_root / "meta" / "info.json")
+                write_data_profile(out_root, source_profile, info=converted_info)
+                write_json(out_root / "meta" / "info.json", converted_info)
             return PreprocessResult(
                 op="split",
                 src_roots=[src_root],
@@ -186,6 +191,7 @@ def run_split(
                 total_frames=legacy_result.total_frames,
                 dry_run=dry_run,
                 summary=summary,
+                episode_lineage=list(legacy_result.episode_lineage),
             )
     info = load_json(src_root / "meta" / "info.json")
     episodes = load_jsonl(src_root / "meta" / "episodes.jsonl")
@@ -207,6 +213,10 @@ def run_split(
         total_frames=total_frames,
         dry_run=dry_run,
         summary={"selected_episodes": len(new_episodes), "tasks": len(new_tasks)},
+        episode_lineage=[
+            {"source_episode_index": old_idx, "output_episode_index": new_idx}
+            for old_idx, new_idx in mapping
+        ],
     )
     emit(
         progress_callback,
@@ -219,10 +229,9 @@ def run_split(
         emit(progress_callback, status="done", current=0, total=len(mapping), message="Dry run complete")
         return result
 
-    write_json(
-        out_root / "meta" / "info.json",
-        update_info_counts(info, len(new_episodes), total_frames, len(new_tasks)),
-    )
+    output_info = update_info_counts(info, len(new_episodes), total_frames, len(new_tasks))
+    write_data_profile(out_root, source_profile, info=output_info)
+    write_json(out_root / "meta" / "info.json", output_info)
     write_jsonl(out_root / "meta" / "tasks.jsonl", new_tasks)
     write_jsonl(out_root / "meta" / "episodes.jsonl", new_episodes)
     write_jsonl(out_root / "meta" / "episodes_stats.jsonl", new_stats)

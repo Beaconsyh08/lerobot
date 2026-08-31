@@ -6,6 +6,12 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from lerobot.data_platform.precompute.data_profile import (
+    SIGNAL_SCHEMA_TRAIN_16D,
+    resolve_data_profile,
+    signal_schema_from_features,
+    write_data_profile,
+)
 from lerobot.data_platform.precompute.preprocess.common import (
     PreprocessResult,
     ProgressCallback,
@@ -262,7 +268,19 @@ def run_convert_action(
             message=f"Converted parquet {idx}/{len(paths)}",
         )
 
-    write_json(out_root / "meta" / "info.json", _updated_info(info, dims, target_dim))
+    output_info = _updated_info(info, dims, target_dim)
+    source_profile = resolve_data_profile(src_root, info.get("features") or {})
+    signal_schema = (
+        SIGNAL_SCHEMA_TRAIN_16D
+        if target_dim == 16
+        else signal_schema_from_features(output_info.get("features") or {})
+    )
+    output_profile = source_profile.for_signal_schema(
+        signal_schema,
+        resolution_source="convert_action",
+    )
+    write_data_profile(out_root, output_profile, info=output_info)
+    write_json(out_root / "meta" / "info.json", output_info)
     _trim_stats_file(
         src_root / "meta" / "episodes_stats.jsonl",
         out_root / "meta" / "episodes_stats.jsonl",

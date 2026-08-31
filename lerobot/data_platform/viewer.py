@@ -104,7 +104,14 @@ from lerobot import available_datasets
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import IterableNamespace
 from lerobot.common.utils.utils import init_logging
+from lerobot.data_platform.admin_auth import ADMIN_SESSION_COOKIE, AdminAuthStore
 from lerobot.data_platform.cli import get_default_output_dir, run_precompute
+from lerobot.data_platform.data_protection import (
+    evaluate_dataset_protection,
+    infer_dataset_stage,
+    normalized_path,
+)
+from lerobot.data_platform.lifecycle import LifecycleStore
 from lerobot.data_platform.operation_log import (
     append_operation_event,
     local_actor,
@@ -118,6 +125,11 @@ from lerobot.data_platform.precompute.analysis import (
 )
 from lerobot.data_platform.precompute.annotation import DEFAULT_FALLBACK_STAGE_COUNT
 from lerobot.data_platform.precompute.construction.review import load_construction_records
+from lerobot.data_platform.precompute.data_profile import (
+    has_body_joint_dimensions,
+    has_legacy_flag_dimension,
+    resolve_data_profile,
+)
 from lerobot.data_platform.precompute.dataset_io import (
     V3DatasetMetadata,
     is_v3_dataset,
@@ -205,7 +217,6 @@ from lerobot.data_platform.precompute.timeseries import (
     DATA_VERSION_DVT1,
     DATA_VERSION_DVT2,
     GRIPPER_NORMALIZE_COLUMNS,
-    infer_data_version_from_features,
     normalize_gripper_columns,
     normalize_gripper_csv_value,
 )
@@ -223,6 +234,7 @@ from lerobot.data_platform.routes import (
     register_compare_routes,
     register_construction_routes,
     register_embedding_routes,
+    register_lifecycle_routes,
     register_preprocess_routes,
     register_tagging_routes,
 )
@@ -481,47 +493,87 @@ CONSOLE_MODE_VISUALIZE = "visualize"
 
 _CONSOLE_GROUP_DEFS = [
     {
-        "key": "preprocess",
-        "label": "Preprocess",
-        "tabs": [
-            {"key": "cache", "label": "Cache"},
-            {"key": "stage_subtask", "label": "Stage & Subtask"},
-            {"key": "quality_flags", "label": "Abnormal Flags"},
-            {"key": "data_modification", "label": "Data Modification"},
-            {"key": "standardize", "label": "Standardize"},
-            {"key": "transform", "label": "Transform"},
-            {"key": "dataset_ops", "label": "Dataset Ops"},
-            {"key": "split_merge", "label": "Split/Merge"},
+        "key": "data_platform",
+        "label": "Data Platform",
+        "pages": [
+            {"key": "datasets", "label": "Datasets", "always": True, "tabs": []},
+            {
+                "key": "preprocessing",
+                "label": "Preprocessing",
+                "tabs": [
+                    {"key": "cache", "label": "Cache"},
+                    {"key": "standardize", "label": "Standardize"},
+                    {"key": "transform", "label": "Transform"},
+                    {"key": "split_merge", "label": "Materialize"},
+                ],
+            },
+            {
+                "key": "versions",
+                "label": "Versions",
+                "tabs": [{"key": "versions", "label": "Versions & Lineage"}],
+            },
+            {"key": "runs", "label": "Pipeline Runs", "always": True, "tabs": []},
         ],
     },
     {
-        "key": "annotate",
-        "label": "Annotate",
-        "tabs": [
-            {"key": "labeling", "label": "Object Labeling"},
-            {"key": "tagging", "label": "Auto-tagging"},
-        ],
-    },
-    {
-        "key": "synthesize",
-        "label": "Synthesize",
-        "tabs": [
-            {"key": "construction", "label": "Data Construction"},
-        ],
-    },
-    {
-        "key": "analyze",
-        "label": "Analyze",
-        "tabs": [
-            {"key": "embedding", "label": "Embedding"},
-            {"key": "compare", "label": "Compare"},
+        "key": "data_curation",
+        "label": "Data Curation",
+        "pages": [
+            {
+                "key": "explore",
+                "label": "Explore",
+                "tabs": [
+                    {"key": "explore_overview", "label": "Overview"},
+                    {"key": "embedding", "label": "Embedding"},
+                    {"key": "compare", "label": "Compare"},
+                ],
+                "open_links": ["viewer", "analysis"],
+            },
+            {
+                "key": "quality",
+                "label": "Quality",
+                "tabs": [{"key": "quality_flags", "label": "Quality Review"}],
+            },
+            {
+                "key": "annotation",
+                "label": "Annotation",
+                "tabs": [
+                    {"key": "stage_subtask", "label": "Stage & Subtask"},
+                    {"key": "labeling", "label": "Object Labeling"},
+                    {"key": "tagging", "label": "Auto-tagging"},
+                ],
+            },
+            {
+                "key": "dataset_build",
+                "label": "Dataset Build",
+                "tabs": [
+                    {"key": "construction", "label": "Data Construction"},
+                    {"key": "curation_manifest", "label": "Cohorts & Dataset Build"},
+                ],
+            },
         ],
     },
 ]
 
+_LEGACY_CONSOLE_GROUP = {
+    "key": "legacy_admin",
+    "label": "Admin Mode",
+    "pages": [
+        {
+            "key": "admin_operations",
+            "label": "Admin Operations",
+            "tabs": [
+                {"key": "data_modification", "label": "Data Modification"},
+                {"key": "dataset_ops", "label": "In-place Dataset Ops"},
+            ],
+        },
+    ],
+}
+
 _CONSOLE_MODE_ALLOWED_TABS = {
     CONSOLE_MODE_FULL: {
         "cache",
+        "explore_overview",
         "stage_subtask",
         "quality_flags",
         "data_modification",
@@ -534,8 +586,10 @@ _CONSOLE_MODE_ALLOWED_TABS = {
         "construction",
         "embedding",
         "compare",
+        "versions",
+        "curation_manifest",
     },
-    CONSOLE_MODE_VISUALIZE: {"cache", "quality_flags", "dataset_ops"},
+    CONSOLE_MODE_VISUALIZE: {"cache", "explore_overview", "quality_flags", "dataset_ops"},
 }
 
 _CONSOLE_MODE_ALLOWED_OPEN_LINKS = {
@@ -560,12 +614,33 @@ def _normalize_console_mode(mode: str | None) -> str:
     return value
 
 
-def _console_groups_for_tabs(allowed_tabs: set[str]) -> list[dict]:
+def _console_groups_for_tabs(
+    allowed_tabs: set[str],
+    *,
+    allowed_open_links: set[str] | None = None,
+    legacy_mutations_enabled: bool = False,
+) -> list[dict]:
+    allowed_open_links = allowed_open_links or set()
     groups = []
-    for group in _CONSOLE_GROUP_DEFS:
-        tabs = [tab for tab in group["tabs"] if tab["key"] in allowed_tabs]
-        if tabs:
-            groups.append({"key": group["key"], "label": group["label"], "tabs": tabs})
+    definitions = list(_CONSOLE_GROUP_DEFS)
+    if legacy_mutations_enabled:
+        definitions.append(_LEGACY_CONSOLE_GROUP)
+    for group in definitions:
+        pages = []
+        for page in group["pages"]:
+            tabs = [tab for tab in page.get("tabs", []) if tab["key"] in allowed_tabs]
+            open_links = [key for key in page.get("open_links", []) if key in allowed_open_links]
+            if page.get("always") or tabs or open_links:
+                pages.append(
+                    {
+                        "key": page["key"],
+                        "label": page["label"],
+                        "tabs": tabs,
+                        "open_links": open_links,
+                    }
+                )
+        if pages:
+            groups.append({"key": group["key"], "label": group["label"], "pages": pages})
     return groups
 
 
@@ -585,6 +660,8 @@ def run_server(
     datasets_root: Path | None = None,
     data_version: str | None = None,
     console_mode: str = CONSOLE_MODE_FULL,
+    legacy_mutations_enabled: bool = False,
+    protected_source_roots: list[Path] | None = None,
 ):
     console_mode = _normalize_console_mode(console_mode)
     allowed_tabs = set(_CONSOLE_MODE_ALLOWED_TABS[console_mode])
@@ -628,6 +705,9 @@ def run_server(
     _flag_sidecar_json_cache: dict[Path, tuple[tuple[str, int, int], dict]] = {}
     _columns_info_cache: dict[tuple, tuple[list[dict], list[str], list[str]]] = {}
     initial_datasets_root = Path(datasets_root).expanduser() if datasets_root else None
+    configured_source_roots = {
+        str(normalized_path(path)) for path in (protected_source_roots or [])
+    }
     registry_state = {
         "datasets_root": initial_datasets_root,
         "path": (
@@ -635,7 +715,19 @@ def run_server(
             if initial_datasets_root is not None
             else static_folder / "datasets_registry.json"
         ),
+        "configured_source_roots": configured_source_roots,
+        "protected_source_roots": set(configured_source_roots),
     }
+
+    def _admin_auth_store() -> AdminAuthStore:
+        registry_path = Path(registry_state["path"])
+        return AdminAuthStore(registry_path.parent.parent / "admin_auth.json")
+
+    def _admin_session_token() -> str | None:
+        return request.cookies.get(ADMIN_SESSION_COOKIE)
+
+    def _admin_authenticated() -> bool:
+        return _admin_auth_store().verify_session(_admin_session_token())
 
     # Background job state for non-blocking trim/delete
     _job_state = {"current": None}  # mutable container for JobState | None
@@ -665,6 +757,37 @@ def run_server(
 
     def _repo_id_from_key(dataset_key: tuple[str, str]) -> str:
         return f"{dataset_key[0]}/{dataset_key[1]}"
+
+    def _protected_source_roots() -> list[Path]:
+        return [Path(value) for value in sorted(registry_state["protected_source_roots"])]
+
+    def _dataset_stage(root_path: Path, declared_stage: str | None = None) -> str:
+        return infer_dataset_stage(root_path, declared_stage)
+
+    def _dataset_protection_for_key(dataset_key: tuple[str, str]) -> dict:
+        entry = datasets_index.get(dataset_key)
+        if entry is None:
+            raise KeyError(f"dataset is not registered: {_repo_id_from_key(dataset_key)}")
+        root_path = Path(entry["root"]).expanduser()
+        return evaluate_dataset_protection(
+            root_path,
+            source_roots=_protected_source_roots(),
+            manual_source=bool(entry.get("manual_source", False)),
+            manual_reason=str(entry.get("manual_source_reason") or ""),
+            stage=_dataset_stage(root_path, str(entry.get("stage") or "")),
+        ).to_dict()
+
+    def _dataset_is_protected(dataset_key: tuple[str, str]) -> bool:
+        return bool(_dataset_protection_for_key(dataset_key)["protected"])
+
+    def _dataset_protection_payload(dataset_key: tuple[str, str]) -> dict:
+        protection = _dataset_protection_for_key(dataset_key)
+        return {
+            "stage": protection["stage"],
+            "source_protected": protection["protected"],
+            "retention_class": protection["retention_class"],
+            "protection": protection,
+        }
 
     def _get_ctx(ns: str, name: str):
         """Get (dataset_obj, static_dir) for given namespace/name, or 404."""
@@ -911,6 +1034,12 @@ def run_server(
             if ft.get("dtype") in {"image", "video"}
         ]
 
+    def _data_profile_for_dataset(dataset_obj):
+        return resolve_data_profile(
+            Path(dataset_obj.root),
+            getattr(dataset_obj, "features", {}) or {},
+        )
+
     def _ensure_viewer_manifest(
         dataset_obj, ds_static: Path, selected_episodes: list[int] | None = None
     ) -> None:
@@ -930,7 +1059,7 @@ def run_server(
                 getattr(dataset_obj, "repo_id", None)
                 or f"local/{Path(getattr(dataset_obj, 'root', 'dataset')).name or 'dataset'}"
             )
-            data_version = infer_data_version_from_features(getattr(dataset_obj, "features", {}) or {})
+            data_version = _data_profile_for_dataset(dataset_obj).legacy_data_version
             write_viewer_manifest(
                 root=Path(dataset_obj.root),
                 repo_id=repo_id,
@@ -972,11 +1101,21 @@ def run_server(
         _ensure_viewer_manifest(dataset_obj, ds_static, selected_episodes)
 
     def _upsert_dataset_index(repo_id: str, root_path: Path, output_dir: Path) -> tuple[str, str]:
+        root_path = normalized_path(root_path)
+        output_dir = normalized_path(output_dir)
         dataset_key = _repo_key(repo_id)
+        existing_for_key = datasets_index.get(dataset_key)
+        if existing_for_key is not None and normalized_path(existing_for_key["root"]) != root_path:
+            suffix = uuid.uuid5(uuid.NAMESPACE_URL, str(root_path)).hex[:8]
+            dataset_key = dataset_key[0], f"{dataset_key[1]}-{suffix}"
+        existing = datasets_index.get(dataset_key) or {}
         datasets_index[dataset_key] = {
             "repo_id": _repo_id_from_key(dataset_key),
-            "root": str(Path(root_path).expanduser()),
-            "output_dir": str(Path(output_dir).expanduser()),
+            "root": str(root_path),
+            "output_dir": str(output_dir),
+            "stage": str(existing.get("stage") or infer_dataset_stage(root_path)),
+            "manual_source": bool(existing.get("manual_source", False)),
+            "manual_source_reason": str(existing.get("manual_source_reason") or ""),
         }
         return dataset_key
 
@@ -1027,15 +1166,24 @@ def run_server(
                 return None
             cached_image_keys = list(_viewer_cache_inventory(ds_static).get("image_keys") or [])
             image_keys = cached_image_keys or list(manifest.get("image_keys") or [])
+            manifest_features = manifest.get("features") or {}
+            manifest_profile = manifest.get("data_profile") or {}
             return {
                 "total_episodes": int(manifest.get("total_episodes") or len(manifest_episode_ids(manifest))),
                 "image_keys": image_keys,
                 "editable_features": [],
                 "data_version": _normalize_data_version(manifest.get("data_version")),
+                "robot_profile": str(manifest_profile.get("robot_profile") or ""),
+                "signal_schema": str(manifest_profile.get("signal_schema") or ""),
+                "stage_profile": str(manifest_profile.get("stage_profile") or ""),
+                "gripper_encoding": str(manifest_profile.get("gripper_encoding") or ""),
+                "profile_confirmed": bool(manifest_profile.get("confirmed", False)),
+                "has_body_joints": has_body_joint_dimensions(manifest_features),
                 "dataset_format_version": str(manifest.get("codebase_version") or ""),
             }
         total_episodes = int(info.get("total_episodes") or 0)
         features = info.get("features") or {}
+        data_profile = resolve_data_profile(root_path, features)
         dataset_format_version = str(info.get("codebase_version") or "")
         is_v3 = dataset_format_version.lower().removeprefix("v").startswith("3.")
         image_keys = [
@@ -1048,7 +1196,13 @@ def run_server(
             "total_episodes": total_episodes,
             "image_keys": image_keys,
             "editable_features": _editable_vector_features(features),
-            "data_version": infer_data_version_from_features(features),
+            "data_version": data_profile.legacy_data_version,
+            "robot_profile": data_profile.robot_profile,
+            "signal_schema": data_profile.signal_schema,
+            "stage_profile": data_profile.stage_profile,
+            "gripper_encoding": data_profile.gripper_encoding,
+            "profile_confirmed": data_profile.confirmed,
+            "has_body_joints": has_body_joint_dimensions(features),
             "dataset_format_version": dataset_format_version,
         }
 
@@ -1552,6 +1706,7 @@ def run_server(
         dataset_obj, ds_static = datasets_registry[dataset_key]
         episode_ids = _dataset_episode_ids(dataset_obj, dataset_key)
         repo_id = _repo_id_from_key(dataset_key)
+        data_profile = _data_profile_for_dataset(dataset_obj)
         return {
             "key": repo_id,
             "repo_id": repo_id,
@@ -1564,7 +1719,13 @@ def run_server(
             "episode_count": len(episode_ids),
             "image_keys": _dataset_image_keys(dataset_obj),
             "editable_features": _editable_vector_features(dataset_obj.features),
-            "data_version": infer_data_version_from_features(dataset_obj.features),
+            "data_version": data_profile.legacy_data_version,
+            "robot_profile": data_profile.robot_profile,
+            "signal_schema": data_profile.signal_schema,
+            "stage_profile": data_profile.stage_profile,
+            "gripper_encoding": data_profile.gripper_encoding,
+            "profile_confirmed": data_profile.confirmed,
+            "has_body_joints": has_body_joint_dimensions(dataset_obj.features),
             "dataset_format_version": str(dataset_obj.meta.info.get("codebase_version") or ""),
             "cache": _cached_light_cache_status(Path(dataset_obj.root), ds_static.parent),
             "labeling": _labeling_status(dataset_key, ds_static),
@@ -1575,6 +1736,7 @@ def run_server(
             "smoothing": _smoothing_status(Path(dataset_obj.root), repo_id),
             "viewer_url": f"/{repo_id}/episode_{episode_ids[0] if episode_ids else 0}",
             "analysis_url": f"/{repo_id}/analysis",
+            **_dataset_protection_payload(dataset_key),
         }
 
     def _serialize_dataset_light(dataset_key: tuple[str, str]) -> dict:
@@ -1603,6 +1765,12 @@ def run_server(
             "image_keys": image_keys,
             "editable_features": list(info.get("editable_features") or []),
             "data_version": info.get("data_version", DATA_VERSION_DVT1),
+            "robot_profile": info.get("robot_profile", ""),
+            "signal_schema": info.get("signal_schema", ""),
+            "stage_profile": info.get("stage_profile", ""),
+            "gripper_encoding": info.get("gripper_encoding", ""),
+            "profile_confirmed": bool(info.get("profile_confirmed", False)),
+            "has_body_joints": bool(info.get("has_body_joints", False)),
             "dataset_format_version": info.get("dataset_format_version", ""),
             "cache": _cached_light_cache_status(root_path, output_dir),
             "labeling": labeling_status,
@@ -1619,6 +1787,7 @@ def run_server(
             "smoothing": _smoothing_status(root_path, repo_id),
             "viewer_url": f"/{repo_id}/episode_{episode_ids[0] if episode_ids else 0}",
             "analysis_url": f"/{repo_id}/analysis",
+            **_dataset_protection_payload(dataset_key),
         }
 
     def _serialize_dataset_fast_detail(dataset_key: tuple[str, str]) -> dict:
@@ -1668,6 +1837,7 @@ def run_server(
             "smoothing": _smoothing_status(root_path, repo_id),
             "viewer_url": f"/{repo_id}/episode_{episode_ids[0] if episode_ids else 0}",
             "analysis_url": f"/{repo_id}/analysis",
+            **_dataset_protection_payload(dataset_key),
         }
 
     def _home_url(repo_id: str | None = None, tab: str | None = None) -> str:
@@ -1718,7 +1888,7 @@ def run_server(
                 )
             except Exception:
                 viewer_ready = viewer_ready
-            data_version = infer_data_version_from_features(getattr(dataset_obj, "features", {}) or {})
+            data_version = _data_profile_for_dataset(dataset_obj).legacy_data_version
             labeling_ready = labeling_ready or labels_path(ds_static / "labeling").is_file()
             tagging_status = _tagging_status(dataset_key, ds_static)
             tagging_ready = tagging_ready or tagging_status["status"] == "ready"
@@ -2071,6 +2241,9 @@ def run_server(
         if load:
             _load_registry(clear_loaded=registry_state["path"] != old_path)
 
+    def _lifecycle_store() -> LifecycleStore:
+        return LifecycleStore(Path(registry_state["path"]).parent / "lifecycle")
+
     def _save_registry() -> None:
         registry_path = registry_state["path"]
         entries = []
@@ -2084,16 +2257,28 @@ def run_server(
                     "repo_id": _repo_id_from_key(dataset_key),
                     "root": str(root_path),
                     "output_dir": str(output_dir),
+                    "stage": str(entry.get("stage") or infer_dataset_stage(root_path)),
+                    "manual_source": bool(entry.get("manual_source", False)),
+                    "manual_source_reason": str(entry.get("manual_source_reason") or ""),
                 }
             )
         try:
             registry_path.parent.mkdir(parents=True, exist_ok=True)
-            registry_path.write_text(json.dumps({"datasets": entries}, indent=2))
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "datasets": entries,
+                        "protected_source_roots": sorted(registry_state["protected_source_roots"]),
+                    },
+                    indent=2,
+                )
+            )
         except OSError as exc:
             logging.warning("Could not save dataset registry to %s: %s", registry_path, exc)
 
     def _load_registry(clear_loaded: bool = False) -> None:
         datasets_index.clear()
+        registry_state["protected_source_roots"] = set(registry_state["configured_source_roots"])
         if clear_loaded:
             datasets_registry.clear()
             episodes_by_key.clear()
@@ -2106,16 +2291,38 @@ def run_server(
         except (json.JSONDecodeError, OSError) as exc:
             logging.warning("Could not load dataset registry from %s: %s", registry_path, exc)
             return
+        persisted_source_roots = {
+            str(normalized_path(value))
+            for value in data.get("protected_source_roots", [])
+            if str(value).strip()
+        }
+        registry_state["protected_source_roots"] = set(
+            registry_state["configured_source_roots"]
+        ) | persisted_source_roots
         for entry in data.get("datasets", []):
             root_path = Path(str(entry.get("root", ""))).expanduser()
             repo_id = str(entry.get("repo_id") or f"local/{root_path.name or 'dataset'}")
             output_dir = Path(entry.get("output_dir") or get_default_output_dir(root_path)).expanduser()
             if not _is_dataset_root(root_path) and not _root_has_cache_manifest(root_path, output_dir):
                 continue
-            _upsert_dataset_index(repo_id, root_path, output_dir)
+            dataset_key = _upsert_dataset_index(repo_id, root_path, output_dir)
+            datasets_index[dataset_key].update(
+                {
+                    "stage": str(entry.get("stage") or infer_dataset_stage(root_path)),
+                    "manual_source": bool(entry.get("manual_source", False)),
+                    "manual_source_reason": str(entry.get("manual_source_reason") or ""),
+                }
+            )
 
     def _is_dataset_root(path: Path) -> bool:
         return path.is_dir() and (path / "meta" / "info.json").is_file()
+
+    def _visible_dataset_keys() -> list[tuple[str, str]]:
+        return [
+            dataset_key
+            for dataset_key in sorted(datasets_index)
+            if _is_dataset_root(Path(datasets_index[dataset_key]["root"]).expanduser())
+        ]
 
     def _dataset_candidates(root_dir: Path | None = None) -> list[dict]:
         if root_dir is None:
@@ -2125,13 +2332,13 @@ def run_server(
             return []
 
         roots: list[Path] = []
-        if _is_dataset_root(root_dir) or _root_has_viewer_cache(root_dir):
+        if _is_dataset_root(root_dir):
             roots.append(root_dir)
         else:
             stack = [root_dir]
             while stack:
                 current = stack.pop()
-                if current != root_dir and (_is_dataset_root(current) or _root_has_viewer_cache(current)):
+                if current != root_dir and _is_dataset_root(current):
                     roots.append(current)
                     continue
                 try:
@@ -2148,28 +2355,29 @@ def run_server(
         for root in roots:
             if _is_dataset_root(root):
                 normalized_roots.setdefault(root, None)
-                continue
-            cache_pair = _cache_only_root_and_output(root)
-            if cache_pair is None:
-                continue
-            normalized_root, normalized_output = cache_pair
-            normalized_roots[normalized_root] = normalized_output
         roots = sorted(normalized_roots, key=lambda item: item.as_posix())
 
         candidates = []
         registered_by_root = {
-            str(Path(entry["root"]).expanduser()): _repo_id_from_key(dataset_key)
+            str(normalized_path(entry["root"])): _repo_id_from_key(dataset_key)
             for dataset_key, entry in datasets_index.items()
         }
         output_by_root = {
-            str(Path(entry["root"]).expanduser()): entry["output_dir"] for entry in datasets_index.values()
+            str(normalized_path(entry["root"])): entry["output_dir"]
+            for entry in datasets_index.values()
         }
         for dataset_root in roots:
+            dataset_root = normalized_path(dataset_root)
             repo_id = f"local/{dataset_root.name or 'dataset'}"
             registered_key = registered_by_root.get(str(dataset_root))
             default_output_dir = normalized_roots.get(dataset_root) or get_default_output_dir(dataset_root)
             output_dir = Path(output_by_root.get(str(dataset_root), str(default_output_dir)))
             info = _read_light_dataset_info(dataset_root, output_dir) or {}
+            protection = evaluate_dataset_protection(
+                dataset_root,
+                source_roots=_protected_source_roots(),
+                stage=_dataset_stage(dataset_root),
+            ).to_dict()
             candidates.append(
                 {
                     "name": dataset_root.name,
@@ -2180,8 +2388,12 @@ def run_server(
                     "registered_key": registered_key,
                     "data_version": info.get("data_version", DATA_VERSION_DVT1),
                     "dataset_format_version": info.get("dataset_format_version", ""),
-                    "cache_only": not _is_dataset_root(dataset_root),
+                    "cache_only": False,
                     "cache": _cached_light_cache_status(dataset_root, output_dir),
+                    "stage": protection["stage"],
+                    "source_protected": protection["protected"],
+                    "retention_class": protection["retention_class"],
+                    "protection": protection,
                 }
             )
         return candidates
@@ -2202,6 +2414,83 @@ def run_server(
     app.logger.setLevel(logging.ERROR)
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # specifying not to cache
     _load_registry()
+
+    def _admin_login_response(token: str):
+        response = jsonify({"status": "ok", "configured": True, "authenticated": True})
+        response.set_cookie(
+            ADMIN_SESSION_COOKIE,
+            token,
+            httponly=True,
+            secure=request.is_secure,
+            samesite="Strict",
+        )
+        return response
+
+    @app.route("/api/admin/status", methods=["GET"])
+    def api_admin_status():
+        store = _admin_auth_store()
+        return jsonify(
+            {
+                "configured": store.is_configured(),
+                "authenticated": store.verify_session(_admin_session_token()),
+            }
+        )
+
+    @app.route("/api/admin/setup", methods=["POST"])
+    def api_admin_setup():
+        body = request.get_json(silent=True) or {}
+        password = str(body.get("password") or "")
+        if password != str(body.get("confirm_password") or ""):
+            return jsonify({"error": "password confirmation does not match"}), 400
+        try:
+            return _admin_login_response(_admin_auth_store().setup_password(password))
+        except ValueError as exc:
+            status = 409 if "already configured" in str(exc) else 400
+            return jsonify({"error": str(exc)}), status
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @app.route("/api/admin/login", methods=["POST"])
+    def api_admin_login():
+        body = request.get_json(silent=True) or {}
+        try:
+            return _admin_login_response(
+                _admin_auth_store().authenticate(str(body.get("password") or ""))
+            )
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @app.route("/api/admin/logout", methods=["POST"])
+    def api_admin_logout():
+        _admin_auth_store().logout(_admin_session_token())
+        response = jsonify({"status": "ok", "configured": _admin_auth_store().is_configured()})
+        response.delete_cookie(ADMIN_SESSION_COOKIE, samesite="Strict")
+        return response
+
+    @app.route("/api/admin/password", methods=["POST"])
+    def api_admin_change_password():
+        if not _admin_authenticated():
+            return jsonify({"error": "Admin Mode is locked"}), 403
+        body = request.get_json(silent=True) or {}
+        new_password = str(body.get("new_password") or "")
+        if new_password != str(body.get("confirm_password") or ""):
+            return jsonify({"error": "password confirmation does not match"}), 400
+        try:
+            token = _admin_auth_store().change_password(
+                str(body.get("current_password") or ""),
+                new_password,
+            )
+            return _admin_login_response(token)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @app.before_request
     def _start_operation_audit():
@@ -2349,6 +2638,102 @@ def run_server(
 
         return None
 
+    def _request_is_legacy_mutation(path: str, body: dict) -> bool:
+        blocked_exact = {
+            "/api/preprocess/apply_prompt_assignments/start",
+            "/api/preprocess/delete_episodes/start",
+            "/api/preprocess/fix_prompt_prepositions/start",
+            "/api/preprocess/flag_fixes/start",
+            "/api/preprocess/lowercase_prompts/start",
+            "/api/preprocess/repair_v3_video_timestamps/start",
+            "/api/preprocess/rewrite_prompts/start",
+        }
+        blocked_suffixes = (
+            "/delete_episode",
+            "/finalize",
+            "/merge",
+            "/subtask_merge_parquet",
+            "/trim_merge",
+        )
+        should_block = path in blocked_exact or path.endswith(blocked_suffixes)
+        if path == "/api/preprocess/value_edit/start":
+            options = body.get("options") or body
+            should_block = str(options.get("output_mode") or "new_dataset") == "in_place"
+        if path == "/api/precompute/start":
+            options = body.get("options") or body
+            mutation_keys = {
+                "fix_episode_indices",
+                "write_parquet",
+                "write_subtask",
+                "overwrite_parquet",
+                "overwrite_subtask_text",
+            }
+            should_block = any(bool(options.get(key)) for key in mutation_keys)
+        return should_block
+
+    def _request_dataset_key(path: str, body: dict) -> tuple[str, str] | None:
+        value = str(body.get("dataset_key") or body.get("repo_id") or "").strip()
+        if value:
+            return _repo_key(value)
+        api_match = re.match(r"^/api/(?:construction|labeling|tagging)/([^/]+)/([^/]+)(?:/|$)", path)
+        if api_match:
+            return api_match.group(1), api_match.group(2)
+        viewer_match = re.match(r"^/([^/]+)/([^/]+)(?:/|$)", path)
+        if viewer_match and viewer_match.group(1) != "api":
+            return viewer_match.group(1), viewer_match.group(2)
+        return None
+
+    @app.before_request
+    def _guard_legacy_in_place_mutations():
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return None
+        path = request.path
+        body = request.get_json(silent=True) or {}
+        if _request_is_legacy_mutation(path, body) and not _admin_authenticated():
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "Admin Mode is locked. Unlock it from the page with the configured "
+                            "administrator password before running an in-place mutation."
+                        )
+                    }
+                ),
+                403,
+            )
+        return None
+
+    @app.before_request
+    def _guard_protected_source_mutations():
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return None
+        path = request.path
+        body = request.get_json(silent=True) or {}
+        if not _request_is_legacy_mutation(path, body):
+            return None
+        dataset_key = _request_dataset_key(path, body)
+        if dataset_key is None or dataset_key not in datasets_index:
+            return None
+        protection = _dataset_protection_for_key(dataset_key)
+        if protection["protected"]:
+            reason_text = ", ".join(
+                str(item.get("value") or item.get("type")) for item in protection["reasons"]
+            )
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Protected source dataset cannot be modified in place: "
+                            f"{_repo_id_from_key(dataset_key)} ({reason_text}). "
+                            "Create a sibling dataset version instead."
+                        ),
+                        "protection": protection,
+                    }
+                ),
+                403,
+            )
+        return None
+
     # Register primary dataset if provided
     if dataset is not None and primary_key:
         _register_dataset(dataset, static_folder.parent, episodes)
@@ -2382,20 +2767,27 @@ def run_server(
 
         return render_template(
             "visualize_dataset_homepage.html",
-            initial_datasets=[_serialize_dataset_light(key) for key in sorted(datasets_index)],
+            initial_datasets=[_serialize_dataset_light(key) for key in _visible_dataset_keys()],
             datasets_root=str(registry_state["datasets_root"]) if registry_state["datasets_root"] else "",
             lerobot_datasets=available_datasets,
             initial_selected_dataset=all_params.get("select", ""),
+            initial_page=all_params.get("page", ""),
             initial_tab=all_params.get("tab", ""),
             console_mode=console_mode,
-            console_groups=_console_groups_for_tabs(allowed_tabs),
+            console_groups=_console_groups_for_tabs(
+                allowed_tabs,
+                allowed_open_links=allowed_open_links,
+                legacy_mutations_enabled=True,
+            ),
             allowed_tabs=sorted(allowed_tabs),
             allowed_open_links=sorted(allowed_open_links),
+            legacy_mutations_enabled=True,
+            admin_authenticated=_admin_authenticated(),
         )
 
     @app.route("/api/datasets")
     def api_datasets():
-        return jsonify({"datasets": [_serialize_dataset_light(key) for key in sorted(datasets_index)]})
+        return jsonify({"datasets": [_serialize_dataset_light(key) for key in _visible_dataset_keys()]})
 
     @app.route("/api/datasets/<string:dataset_namespace>/<string:dataset_name>")
     def api_dataset_detail(dataset_namespace, dataset_name):
@@ -2431,6 +2823,65 @@ def run_server(
         _save_registry()
         return jsonify({"status": "ok", "dataset_key": _repo_id_from_key(dataset_key)})
 
+    @app.route(
+        "/api/datasets/<string:dataset_namespace>/<string:dataset_name>/protection",
+        methods=["PATCH"],
+    )
+    def api_dataset_protection(dataset_namespace, dataset_name):
+        dataset_key = (dataset_namespace, dataset_name)
+        entry = datasets_index.get(dataset_key)
+        if entry is None:
+            return jsonify({"error": f"dataset is not registered: {_repo_id_from_key(dataset_key)}"}), 404
+        body = request.get_json(silent=True) or {}
+        if "protected" not in body:
+            return jsonify({"error": "protected is required"}), 400
+        manual_source = _bool_option(body, "protected", False)
+        entry["manual_source"] = manual_source
+        entry["manual_source_reason"] = (
+            str(body.get("reason") or "Manual source protection") if manual_source else ""
+        )
+        _save_registry()
+        protection = _dataset_protection_for_key(dataset_key)
+        ds_static = _static_dir_for_key(dataset_key)
+        if ds_static is not None:
+            _append_operation_log(
+                ds_static,
+                "dataset_protection_update",
+                dataset_key=dataset_key,
+                dataset_root=Path(entry["root"]),
+                details={"protection": protection},
+            )
+        return jsonify({"dataset": _serialize_dataset_fast_detail(dataset_key)})
+
+    @app.route("/api/source_roots", methods=["GET", "PATCH"])
+    def api_source_roots():
+        if request.method == "GET":
+            return jsonify({"source_roots": [str(path) for path in _protected_source_roots()]})
+        body = request.get_json(silent=True) or {}
+        root_value = str(body.get("root") or "").strip()
+        if not root_value:
+            return jsonify({"error": "root is required"}), 400
+        root_path = normalized_path(root_value)
+        if not root_path.is_dir():
+            return jsonify({"error": f"source root does not exist: {root_path}"}), 400
+        protected = _bool_option(body, "protected", True)
+        value = str(root_path)
+        if protected:
+            registry_state["protected_source_roots"].add(value)
+        else:
+            if value in registry_state["configured_source_roots"]:
+                return jsonify(
+                    {"error": "source root is configured by the CLI and requires a restart to remove"}
+                ), 409
+            registry_state["protected_source_roots"].discard(value)
+        _save_registry()
+        return jsonify(
+            {
+                "source_roots": [str(path) for path in _protected_source_roots()],
+                "datasets": [_serialize_dataset_light(key) for key in _visible_dataset_keys()],
+            }
+        )
+
     @app.route("/api/dataset_roots")
     def api_dataset_roots():
         root_value = request.args.get("root_dir")
@@ -2442,6 +2893,14 @@ def run_server(
                 "root_dir": str(root_dir) if root_dir else "",
                 "candidates": _dataset_candidates(root_dir),
                 "registry_path": str(registry_state["path"]),
+                "source_roots": [str(path) for path in _protected_source_roots()],
+                "root_protected": bool(
+                    root_dir
+                    and evaluate_dataset_protection(
+                        root_dir,
+                        source_roots=_protected_source_roots(),
+                    ).protected
+                ),
             }
         )
 
@@ -2466,26 +2925,18 @@ def run_server(
             try:
                 if not root_path.exists():
                     raise ValueError(f"dataset root does not exist: {root_path}")
+                if not _is_dataset_root(root_path):
+                    raise ValueError(
+                        "cache-only registration is temporarily unavailable; "
+                        f"a dataset requires {root_path / 'meta' / 'info.json'}"
+                    )
                 explicit_output_dir = str(body.get("output_dir") or "").strip()
-                cache_pair = None if _is_dataset_root(root_path) else _cache_only_root_and_output(root_path)
-                if cache_pair is not None and not explicit_output_dir:
-                    root_path, cache_output_dir = cache_pair
-                else:
-                    cache_output_dir = None
 
                 explicit_repo_id = str(body.get("repo_id") or "").strip() if len(roots) == 1 else ""
                 repo_id = explicit_repo_id or f"local/{root_path.name or 'dataset'}"
                 if "/" not in repo_id:
                     repo_id = f"local/{repo_id}"
-                output_dir = Path(
-                    explicit_output_dir or cache_output_dir or get_default_output_dir(root_path)
-                ).expanduser()
-                if not (root_path / "meta" / "info.json").is_file() and not _root_has_viewer_cache(
-                    root_path, output_dir
-                ):
-                    raise ValueError(
-                        f"missing dataset metadata or viewer cache: {root_path / 'meta' / 'info.json'}"
-                    )
+                output_dir = Path(explicit_output_dir or get_default_output_dir(root_path)).expanduser()
                 dataset_key = _upsert_dataset_index(repo_id, root_path, output_dir)
                 registered.append(_serialize_dataset_light(dataset_key))
                 _append_operation_log(
@@ -2609,7 +3060,7 @@ def run_server(
                     {
                         "status": "running",
                         "message": (
-                            f"Using data format: {data_version}; "
+                            f"Using robot/Stage profile: {data_version}; "
                             f"force stage recompute: {_bool_option(options, 'force_recompute_stage', False)}; "
                             f"overwrite CSV: {_bool_option(options, 'overwrite_csv', False)}"
                         ),
@@ -3369,6 +3820,9 @@ def run_server(
                 dataset_name=dataset_name,
             ),
             tagging_api_base_url=f"/api/tagging/{repo_id}",
+            legacy_mutations_enabled=(
+                _admin_authenticated() and not _dataset_is_protected(dataset_key)
+            ),
             viewer_url=f"/{repo_id}/episode_{episode_ids[0] if episode_ids else 0}",
             **_dataset_nav(
                 repo_id,
@@ -3708,7 +4162,12 @@ def run_server(
         clear_dataset_caches=_clear_episode_dependent_caches,
         refresh_dataset_after_episode_delete=_refresh_dataset_after_episode_delete,
         static_dir_for_key=_static_dir_for_key,
+        lifecycle_store=_lifecycle_store,
+        legacy_mutations_enabled=True,
+        dataset_is_protected=_dataset_is_protected,
     )
+    if any(_tab_enabled(tab) for tab in ("versions", "curation_manifest")):
+        register_lifecycle_routes(app, route_context)
     if any(
         _tab_enabled(tab)
         for tab in (
@@ -4092,7 +4551,10 @@ def run_server(
                 trim_merge_url="",
                 delete_episode_url="",
                 annotate_enabled=False,
+                legacy_mutations_enabled=False,
                 data_version=data_version,
+                has_body_joints=has_body_joint_dimensions(manifest.get("features") or {}),
+                has_legacy_flag=has_legacy_flag_dimension(manifest.get("features") or {}),
                 issue_episodes=[],
                 current_issue_episode=current_issue_episode,
                 stage_edit_enabled=False,
@@ -4219,7 +4681,7 @@ def run_server(
         data_version = (
             _normalize_data_version(request.args.get("data_version"))
             if request.args.get("data_version")
-            else infer_data_version_from_features(getattr(dataset_obj, "features", {}) or {})
+            else _data_profile_for_dataset(dataset_obj).legacy_data_version
         )
         server_state["data_version"] = data_version
         dataset_version = (
@@ -4456,7 +4918,12 @@ def run_server(
                     dataset_name=dataset_name,
                 ),
                 annotate_enabled=server_state["annotate"],
+                legacy_mutations_enabled=(
+                    _admin_authenticated() and not _dataset_is_protected(dataset_key)
+                ),
                 data_version=data_version,
+                has_body_joints=has_body_joint_dimensions(dataset_obj.features),
+                has_legacy_flag=has_legacy_flag_dimension(dataset_obj.features),
                 issue_episodes=[],
                 current_issue_episode=current_issue_episode,
                 stage_edit_enabled=server_state["annotate"] or current_issue_episode,
@@ -4614,7 +5081,7 @@ def run_server(
             data_version = (
                 _normalize_data_version(request.args.get("data_version"))
                 if request.args.get("data_version")
-                else infer_data_version_from_features(getattr(dataset_obj, "features", {}) or {})
+                else _data_profile_for_dataset(dataset_obj).legacy_data_version
             )
             server_state["data_version"] = data_version
             if cache_path is None or not cache_path.is_file():
@@ -5170,14 +5637,17 @@ def run_server(
             reason = str(body.get("reason") or "").strip()
             if not selected_task:
                 raise ValueError("selected_task is required")
-            if dataset_obj is None:
+            if dataset_obj is None or not _admin_authenticated() or _dataset_is_protected(dataset_key):
                 pending = _upsert_pending_prompt_assignment(ds_static, episode_id, selected_task)
                 result = {
                     "episode_index": episode_id,
                     "selected_task": selected_task,
                     "pending": True,
                     "pending_count": pending["pending_count"],
-                    "message": "Saved to static/prompt_assignments_pending.json. Apply it from Preprocess > Dataset Ops when the source dataset is available.",
+                    "message": (
+                        "Saved as a Data Curation sidecar decision. Publish a curation manifest "
+                        "to materialize it into a new dataset version."
+                    ),
                 }
                 _append_operation_log(
                     ds_static,
@@ -5574,6 +6044,11 @@ def run_server(
         episode_id = body.get("episode_id")
         if episode_id is None:
             return jsonify({"error": "episode_id required"}), 400
+        reason = str(body.get("reason") or "").strip()
+        if not reason:
+            return jsonify({"error": "reason is required for in-place frame deletion"}), 400
+        if len(reason) > 500:
+            return jsonify({"error": "reason must be 500 characters or fewer"}), 400
         episode_id = int(episode_id)
         denied = _check_edit_permission(ds_static, episode_id)
         if denied:
@@ -5605,7 +6080,7 @@ def run_server(
                     dataset_root=Path(dataset.root),
                     episode_ids=[episode_id],
                     status="failed",
-                    details=data_dict,
+                    details={**data_dict, "reason": reason},
                 )
             return f"event: {event_type}\ndata: {json.dumps(data_dict)}\n\n"
 
@@ -5684,7 +6159,12 @@ def run_server(
                     dataset_key=(dataset_namespace, dataset_name),
                     dataset_root=Path(dataset.root),
                     episode_ids=[episode_id],
-                    details={**result, "dataset_format": "v3.0", "workers": 8},
+                    details={
+                        **result,
+                        "dataset_format": "v3.0",
+                        "workers": 8,
+                        "reason": reason,
+                    },
                 )
                 yield _sse(
                     "done",
@@ -6095,6 +6575,7 @@ def run_server(
                     "new_length": new_length,
                     "dropped_frames": dropped_frames,
                     "new_duration": new_duration,
+                    "reason": reason,
                 },
             )
 
@@ -6113,6 +6594,11 @@ def run_server(
         episode_id = body.get("episode_id")
         if episode_id is None:
             return jsonify({"error": "episode_id required"}), 400
+        reason = str(body.get("reason") or "").strip()
+        if not reason:
+            return jsonify({"error": "reason is required for in-place episode deletion"}), 400
+        if len(reason) > 500:
+            return jsonify({"error": "reason must be 500 characters or fewer"}), 400
         episode_id = int(episode_id)
         denied = _check_edit_permission(ds_static, episode_id)
         if denied:
@@ -6132,7 +6618,7 @@ def run_server(
                     dataset_root=Path(dataset.root),
                     episode_ids=[episode_id],
                     status="failed",
-                    details=data_dict,
+                    details={**data_dict, "reason": reason},
                 )
             return f"event: {event_type}\ndata: {json.dumps(data_dict)}\n\n"
 
@@ -6171,7 +6657,7 @@ def run_server(
                     dataset_key=(dataset_namespace, dataset_name),
                     dataset_root=Path(dataset.root),
                     episode_ids=[episode_id],
-                    details={**result, "dataset_format": "v3.0"},
+                    details={**result, "dataset_format": "v3.0", "reason": reason},
                 )
                 yield _sse(
                     "progress",
@@ -6487,6 +6973,7 @@ def run_server(
                     "shifted_count": len(indices_to_shift),
                     "new_total_episodes": new_total_eps,
                     "next_episode": next_ep,
+                    "reason": reason,
                 },
             )
             yield _sse("done", {"status": "ok", "episode_id": episode_id, "next_episode": next_ep})
@@ -6740,6 +7227,11 @@ def run_server(
             return jsonify({"error": str(exc)}), 400
 
         options = body.get("options") or body
+        reason = str(options.get("reason") or "").strip()
+        if not reason:
+            return jsonify({"error": "reason is required for in-place episode deletion"}), 400
+        if len(reason) > 500:
+            return jsonify({"error": "reason must be 500 characters or fewer"}), 400
         episode_ids = _parse_int_list(options.get("episodes") or options.get("episode_ids"))
         if not episode_ids:
             return jsonify({"error": "episodes is required, e.g. 0,1,2"}), 400
@@ -6835,7 +7327,7 @@ def run_server(
                     dataset_key=dataset_key,
                     dataset_root=Path(dataset_obj.root),
                     episode_ids=list(reversed(episode_ids)),
-                    details={"result": result, "job_id": job_id},
+                    details={"result": result, "job_id": job_id, "reason": reason},
                 )
                 _update_delete_job(
                     {
@@ -7171,6 +7663,8 @@ def visualize_dataset_html(
     datasets_root: Path | None = None,
     data_version: str = DATA_VERSION_DVT1,
     console_mode: str = CONSOLE_MODE_FULL,
+    legacy_mutations_enabled: bool = False,
+    protected_source_roots: list[Path] | None = None,
 ) -> Path | None:
     init_logging()
 
@@ -7210,6 +7704,8 @@ def visualize_dataset_html(
                 datasets_root=datasets_root,
                 data_version=data_version,
                 console_mode=console_mode,
+                legacy_mutations_enabled=legacy_mutations_enabled,
+                protected_source_roots=protected_source_roots,
             )
     else:
         # Symlink source MP4 files into the served output directory.
@@ -7242,7 +7738,11 @@ def visualize_dataset_html(
                         image_keys=image_keys,
                         static_dir=static_dir,
                         data_version=_normalize_data_version(
-                            data_version or infer_data_version_from_features(dataset.features)
+                            data_version
+                            or resolve_data_profile(
+                                Path(dataset.root),
+                                dataset.features,
+                            ).legacy_data_version
                         ),
                         downsample=downsample,
                     )
@@ -7266,6 +7766,8 @@ def visualize_dataset_html(
                 datasets_root=datasets_root,
                 data_version=data_version,
                 console_mode=console_mode,
+                legacy_mutations_enabled=legacy_mutations_enabled,
+                protected_source_roots=protected_source_roots,
             )
 
 
@@ -7365,7 +7867,10 @@ def main():
         type=str,
         choices=[DATA_VERSION_DVT1, DATA_VERSION_DVT2],
         default=None,
-        help="Override inferred dataset schema version. By default this is inferred from action/state dimensions.",
+        help=(
+            "Override the robot/Stage profile. By default the portable dataset profile is used; "
+            "dimensions are only a legacy fallback."
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -7381,6 +7886,22 @@ def main():
         type=str,
         choices=[CONSOLE_MODE_FULL, CONSOLE_MODE_VISUALIZE],
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--enable-legacy-mutations",
+        dest="legacy_mutations_enabled",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--protected-source-root",
+        dest="protected_source_roots",
+        type=Path,
+        action="append",
+        default=[],
+        help="Protect datasets below this path from in-place mutation; repeat as needed.",
     )
 
     parser.add_argument(

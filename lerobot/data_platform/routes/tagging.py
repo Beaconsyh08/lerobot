@@ -286,6 +286,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             episode_ids = sorted(records)
             image_key = _tagging_image_key(ds_static, active_variant)
         first_episode = episode_ids[0] if episode_ids else 0
+        source_protected = bool(
+            ctx.dataset_is_protected and ctx.dataset_is_protected(dataset_key)
+        )
         return render_template(
             "visualize_dataset_tagging.html",
             dataset_namespace=dataset_namespace,
@@ -293,6 +296,9 @@ def register_tagging_routes(app, ctx: RouteContext) -> None:
             dataset_key=repo_id,
             image_key=image_key,
             cache_only=cache_only,
+            legacy_mutations_enabled=(
+                bool(getattr(ctx, "legacy_mutations_enabled", False)) and not source_protected
+            ),
             viewer_url=f"/{repo_id}/episode_{first_episode}",
             **ctx.dataset_nav(
                 repo_id, first_episode, "tagging", dataset_obj, ds_static, cache_only=cache_only

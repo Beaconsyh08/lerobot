@@ -42,7 +42,7 @@
 <body>
   {% set page_kind = "Auto-tagging" %}
   {% set page_title = dataset_key %}
-  {% set page_subtitle = "Review episode tags, trajectory projection, and merge tags to metadata." %}
+  {% set page_subtitle = "Review episode tags and trajectory projection; publish reviewed tags through a Curation Manifest." %}
   {% include "visualize_dataset_topbar.html" %}
   <div id="taggingLayout">
   <aside id="left">
@@ -74,8 +74,10 @@
       </div>
       {% if cache_only %}
         <div class="hint" style="margin-top:8px">cache-only: review/save changes stay in local_vis; merge needs the original dataset.</div>
-      {% else %}
+      {% elif legacy_mutations_enabled %}
         <button style="margin-top:8px" onclick="mergeTags()">Merge to metadata</button>
+      {% else %}
+        <div class="hint" style="margin-top:8px">Reviewed tags remain in local_vis until they are published in a Curation Manifest.</div>
       {% endif %}
     </div>
     <div class="panel">

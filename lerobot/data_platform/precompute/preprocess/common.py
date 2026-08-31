@@ -19,6 +19,7 @@ class PreprocessResult:
     total_frames: int = 0
     dry_run: bool = False
     summary: dict = field(default_factory=dict)
+    episode_lineage: list[dict] = field(default_factory=list)
 
 
 def emit(progress_callback: ProgressCallback, **payload) -> None:

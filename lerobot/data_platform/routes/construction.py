@@ -7,6 +7,7 @@ from pathlib import Path
 
 from flask import jsonify, render_template, request
 
+from lerobot.data_platform.cli import get_default_output_dir
 from lerobot.data_platform.precompute.construction import (
     default_synthetic_path,
     preview_construction,
@@ -14,15 +15,17 @@ from lerobot.data_platform.precompute.construction import (
 )
 from lerobot.data_platform.precompute.construction.review import (
     finalize as finalize_construction,
+)
+from lerobot.data_platform.precompute.construction.review import (
     load_construction_doc,
     load_construction_records,
+)
+from lerobot.data_platform.precompute.construction.review import (
     save_decision as save_construction_decision,
 )
 from lerobot.data_platform.precompute.labeling.review import (
-    labels_path,
     load_episode_record as load_labeling_episode_record,
 )
-from lerobot.data_platform.cli import get_default_output_dir
 from lerobot.data_platform.routes.context import RouteContext
 
 
@@ -71,13 +74,14 @@ def register_construction_routes(app, ctx: RouteContext) -> None:
         threshold = int(options.get("uncertainty_threshold") or 50)
         oversample_factor = max(1.0, float(options.get("oversample_factor") or 1.0))
         per_scenario_counts = {
-            str(key): int(value or 0)
-            for key, value in dict(options.get("per_scenario_counts") or {}).items()
+            str(key): int(value or 0) for key, value in dict(options.get("per_scenario_counts") or {}).items()
         }
         include_positives = ctx.bool_option(options, "include_positives", False)
         allow_pick_to_give = ctx.bool_option(options, "allow_pick_to_give", False)
         out_root_value = str(options.get("out_root") or "").strip()
-        out_root = Path(out_root_value).expanduser() if out_root_value else default_synthetic_path(dataset_obj.root)
+        out_root = (
+            Path(out_root_value).expanduser() if out_root_value else default_synthetic_path(dataset_obj.root)
+        )
         config = {
             "uncertainty_threshold": threshold,
             "per_scenario_counts": per_scenario_counts,
@@ -166,6 +170,7 @@ def register_construction_routes(app, ctx: RouteContext) -> None:
             dataset_name=dataset_name,
             dataset_key=repo_id,
             viewer_url=f"/{repo_id}/episode_{first_episode}",
+            legacy_mutations_enabled=bool(getattr(ctx, "legacy_mutations_enabled", False)),
             **ctx.dataset_nav(repo_id, first_episode, "construction", dataset_obj, ds_static),
         )
 
@@ -222,7 +227,10 @@ def register_construction_routes(app, ctx: RouteContext) -> None:
                 return jsonify(_construction_record_payload(dataset_key, record))
         return jsonify({"error": "not found"}), 404
 
-    @app.route("/api/construction/<string:dataset_namespace>/<string:dataset_name>/decision/<int:new_idx>", methods=["POST"])
+    @app.route(
+        "/api/construction/<string:dataset_namespace>/<string:dataset_name>/decision/<int:new_idx>",
+        methods=["POST"],
+    )
     def api_construction_decision(dataset_namespace, dataset_name, new_idx):
         dataset_obj, _ = ctx.get_ctx(dataset_namespace, dataset_name)
         body = request.get_json(silent=True) or {}
@@ -239,7 +247,9 @@ def register_construction_routes(app, ctx: RouteContext) -> None:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"record": record})
 
-    @app.route("/api/construction/<string:dataset_namespace>/<string:dataset_name>/finalize", methods=["POST"])
+    @app.route(
+        "/api/construction/<string:dataset_namespace>/<string:dataset_name>/finalize", methods=["POST"]
+    )
     def api_construction_finalize(dataset_namespace, dataset_name):
         dataset_key = (dataset_namespace, dataset_name)
         dataset_obj, ds_static = ctx.get_ctx(dataset_namespace, dataset_name)
